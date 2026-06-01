@@ -240,9 +240,51 @@ class BodiesClassGeneratorTest {
         assertTrue(body.access and ACC_STATIC != 0, "body 方法应为 static")
     }
 
+    @Test
+    @DisplayName("运行时方法名被映射时 body 使用声明方法别名")
+    fun remappedRuntimeMethodUsesDeclaredBodyName() {
+        val bytes = generate(
+            buildAliasedTargetBytes("a"),
+            targetMethods = setOf("a" to "()I"),
+            bodyMethodNames = mapOf(("a" to "()I") to "drop\$body"),
+        )
+        assertNotNull(bytes)
+        val node = readNode(bytes!!)
+        val methodNames = node.methods.map { it.name }
+
+        assertTrue(methodNames.contains("drop\$body"), "运行时方法 a 应生成声明名 drop\$body")
+        assertFalse(methodNames.contains("a\$body"), "不得只生成运行时名 a\$body")
+    }
+
     // ===== 工具 =====
 
-    private fun generate(originalBytes: ByteArray, targetMethods: Set<Pair<String, String>>): ByteArray? {
-        return BodiesClassGenerator.generate(originalBytes, ownerInternal, targetMethods)
+    private fun buildAliasedTargetBytes(runtimeMethodName: String): ByteArray {
+        val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES or ClassWriter.COMPUTE_MAXS)
+        cw.visit(V1_8, ACC_PUBLIC, ownerInternal, null, "java/lang/Object", null)
+        cw.visitMethod(ACC_PUBLIC, "<init>", "()V", null, null).apply {
+            visitCode()
+            visitVarInsn(ALOAD, 0)
+            visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
+            visitInsn(RETURN)
+            visitMaxs(0, 0)
+            visitEnd()
+        }
+        cw.visitMethod(ACC_PUBLIC, runtimeMethodName, "()I", null, null).apply {
+            visitCode()
+            visitInsn(ICONST_0)
+            visitInsn(IRETURN)
+            visitMaxs(0, 0)
+            visitEnd()
+        }
+        cw.visitEnd()
+        return cw.toByteArray()
+    }
+
+    private fun generate(
+        originalBytes: ByteArray,
+        targetMethods: Set<Pair<String, String>>,
+        bodyMethodNames: Map<Pair<String, String>, String> = emptyMap(),
+    ): ByteArray? {
+        return BodiesClassGenerator.generate(originalBytes, ownerInternal, targetMethods, bodyMethodNames)
     }
 }

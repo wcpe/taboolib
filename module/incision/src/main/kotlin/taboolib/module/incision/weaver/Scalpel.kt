@@ -5,7 +5,7 @@ import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.MethodVisitor
 import org.objectweb.asm.Opcodes
 import org.objectweb.asm.commons.AdviceAdapter
-import org.objectweb.asm.commons.ClassRemapper
+import taboolib.module.incision.api.Anchor
 import taboolib.module.incision.api.MethodCoordinate
 import taboolib.module.incision.cache.IncisionCache
 import taboolib.module.incision.diagnostic.Forensics
@@ -40,6 +40,12 @@ class Scalpel(
         val sites: List<SiteSpec> = emptyList(),
     )
 
+    private data class ResolvedAdviceTargetSpec(
+        val original: AdviceTargetSpec,
+        val matchTarget: MethodCoordinate,
+        val sites: List<SiteSpec>,
+    )
+
     fun weave(originalBytes: ByteArray): ByteArray {
         return try {
             val probeReader = ClassReader(originalBytes)
@@ -51,20 +57,19 @@ class Scalpel(
             val reader = ClassReader(sourceBytes)
             val owner = reader.className
             val targets = targetsByOwner[owner] ?: return originalBytes
+            val methodSignatures = collectMethodSignatures(reader)
+            val resolvedTargets = targets.map { resolveAdviceTarget(owner, it, methodSignatures) }
             val loader = currentTransformLoader.get()
             val writer = SafeClassWriter(reader, loader)
-            val visitor = WeavingClassVisitor(Opcodes.ASM9, writer, targets)
-            val pipeline = if (resolver.isRemappableTarget(owner)) {
-                ClassRemapper(visitor, RemapperBridge(resolver))
-            } else visitor
-            reader.accept(pipeline, ClassReader.EXPAND_FRAMES)
+            val visitor = WeavingClassVisitor(Opcodes.ASM9, writer, resolvedTargets)
+            reader.accept(visitor, ClassReader.EXPAND_FRAMES)
             var bytes = writer.toByteArray()
             // 二次 pass — 走 SiteWeaver 处理 GRAFT / BYPASS / TRIM 站点
-            val anySites = targets.any { it.sites.isNotEmpty() }
+            val anySites = resolvedTargets.any { it.sites.isNotEmpty() }
             if (anySites) {
-                bytes = applySiteWeaver(bytes, targets, loader)
+                bytes = applySiteWeaver(bytes, resolvedTargets, loader)
             }
-            generateAndRegisterBodies(owner, sourceBytes, targets)
+            generateAndRegisterBodies(owner, sourceBytes, resolvedTargets)
             devDumpIfEnabled(owner, sourceBytes, bytes)
             bytes
         } catch (t: Throwable) {
@@ -97,6 +102,81 @@ class Scalpel(
         }
     }
 
+    private fun collectMethodSignatures(reader: ClassReader): Set<Pair<String, String>> {
+        val node = org.objectweb.asm.tree.ClassNode()
+        reader.accept(node, ClassReader.SKIP_CODE or ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES)
+        return node.methods.map { it.name to it.desc }.toSet()
+    }
+
+    private fun resolveAdviceTarget(
+        owner: String,
+        spec: AdviceTargetSpec,
+        methodSignatures: Set<Pair<String, String>>,
+    ): ResolvedAdviceTargetSpec {
+        val matchTarget = resolveMethodTarget(owner, spec.target, methodSignatures)
+        val sites = spec.sites.flatMap { resolveSiteCandidates(it) }.distinct()
+        return ResolvedAdviceTargetSpec(spec, matchTarget, sites)
+    }
+
+    private fun resolveMethodTarget(
+        owner: String,
+        target: MethodCoordinate,
+        methodSignatures: Set<Pair<String, String>>,
+    ): MethodCoordinate {
+        if (hasMethod(methodSignatures, target.name, target.descriptor)) {
+            return target.copy(owner = owner)
+        }
+        val (resolvedName, resolvedDesc) = resolver.resolveMethod(owner, target.name, target.descriptor)
+        return MethodCoordinate(owner, resolvedName, resolvedDesc)
+    }
+
+    private fun hasMethod(methodSignatures: Set<Pair<String, String>>, name: String, descriptor: String): Boolean {
+        return methodSignatures.any { (actualName, actualDesc) ->
+            actualName == name && matchesDesc(descriptor, actualDesc)
+        }
+    }
+
+    private fun resolveSiteCandidates(site: SiteSpec): List<SiteSpec> {
+        val remapped = when (site.anchor) {
+            Anchor.INVOKE -> resolveInvokeSite(site)
+            Anchor.FIELD_GET, Anchor.FIELD_PUT -> resolveFieldSite(site)
+            Anchor.NEW -> resolveNewSite(site)
+            else -> site
+        }
+        return listOf(site, remapped).distinct()
+    }
+
+    private fun resolveInvokeSite(site: SiteSpec): SiteSpec {
+        if (site.ownerPattern.isEmpty()) return site
+        val resolvedOwner = resolver.resolveOwner(site.ownerPattern)
+        var resolvedName = site.namePattern
+        var resolvedDesc = site.descPattern
+        if (site.namePattern.isNotEmpty()) {
+            val mapped = resolver.resolveMethod(site.ownerPattern, site.namePattern, site.descPattern)
+            resolvedName = mapped.first
+            resolvedDesc = mapped.second
+        }
+        return site.copy(ownerPattern = resolvedOwner, namePattern = resolvedName, descPattern = resolvedDesc)
+    }
+
+    private fun resolveFieldSite(site: SiteSpec): SiteSpec {
+        if (site.ownerPattern.isEmpty()) return site
+        val resolvedOwner = resolver.resolveOwner(site.ownerPattern)
+        var resolvedName = site.namePattern
+        var resolvedDesc = site.descPattern
+        if (site.namePattern.isNotEmpty()) {
+            val mapped = resolver.resolveField(site.ownerPattern, site.namePattern, site.descPattern)
+            resolvedName = mapped.first
+            resolvedDesc = mapped.second
+        }
+        return site.copy(ownerPattern = resolvedOwner, namePattern = resolvedName, descPattern = resolvedDesc)
+    }
+
+    private fun resolveNewSite(site: SiteSpec): SiteSpec {
+        if (site.ownerPattern.isEmpty()) return site
+        return site.copy(ownerPattern = resolver.resolveOwner(site.ownerPattern))
+    }
+
     private fun devDumpIfEnabled(owner: String, before: ByteArray, after: ByteArray) {
         if (System.getProperty("incision.dev", "false").toBoolean().not()) return
         val dir = File(System.getProperty("incision.devDir", ".dev/incision"))
@@ -115,7 +195,7 @@ class Scalpel(
      *
      * 回退策略：Forensics.warn 记录失败方法与原因，返回 `bytes` 不动。保守避免把坏 class 喂给 JVM 触发 VerifyError。
      */
-    private fun applySiteWeaver(bytes: ByteArray, targets: List<AdviceTargetSpec>, loader: ClassLoader?): ByteArray {
+    private fun applySiteWeaver(bytes: ByteArray, targets: List<ResolvedAdviceTargetSpec>, loader: ClassLoader?): ByteArray {
         val reader = ClassReader(bytes)
         val original = org.objectweb.asm.tree.ClassNode()
         reader.accept(original, ClassReader.EXPAND_FRAMES)
@@ -144,7 +224,7 @@ class Scalpel(
 
         for (method in original.methods) {
             val sites = targets
-                .filter { it.target.name == method.name && matchesDesc(it.target.descriptor, method.desc) }
+                .filter { it.matchTarget.name == method.name && matchesDesc(it.matchTarget.descriptor, method.desc) }
                 .flatMap { it.sites }
             if (sites.isNullOrEmpty()) {
                 weaved.methods.add(method)
@@ -232,13 +312,16 @@ class Scalpel(
     private fun generateAndRegisterBodies(
         owner: String,
         originalBytes: ByteArray,
-        targets: List<AdviceTargetSpec>,
+        targets: List<ResolvedAdviceTargetSpec>,
     ) {
-        val spliceMethods: Set<Pair<String, String>> = targets
-            .filter { it.kinds.any { k -> k in bodyKinds } }
-            .map { it.target.name to it.target.descriptor }
+        val bodyTargets = targets.filter { it.original.kinds.any { k -> k in bodyKinds } }
+        val spliceMethods: Set<Pair<String, String>> = bodyTargets
+            .map { it.matchTarget.name to it.matchTarget.descriptor }
             .toSet()
         if (spliceMethods.isEmpty()) return
+        val bodyMethodNames = bodyTargets.associate {
+            (it.matchTarget.name to it.matchTarget.descriptor) to (it.original.target.name + BodiesClassGenerator.BODY_METHOD_SUFFIX)
+        }
         val bodiesName = BridgeClassLoader.bodiesClassName(owner)
         if (BridgeClassLoader.INSTANCE.hasBodies(bodiesName)) return
         val sourceBytes = try {
@@ -252,7 +335,7 @@ class Scalpel(
             originalBytes
         }
         val bodiesBytes = try {
-            BodiesClassGenerator.generate(sourceBytes, owner, spliceMethods)
+            BodiesClassGenerator.generate(sourceBytes, owner, spliceMethods, bodyMethodNames)
         } catch (t: Throwable) {
             Forensics.error("BodiesClassGenerator.generate failed: $owner — ${t.message}", t)
             null
@@ -280,17 +363,9 @@ class Scalpel(
         return false
     }
 
-    private class RemapperBridge(val r: NameResolver) : org.objectweb.asm.commons.Remapper() {
-        override fun map(internalName: String): String = r.resolveOwner(internalName)
-        override fun mapMethodName(owner: String, name: String, descriptor: String): String =
-            r.resolveMethod(owner, name, descriptor).first
-        override fun mapFieldName(owner: String, name: String, descriptor: String): String =
-            r.resolveField(owner, name, descriptor).first
-    }
-
     private class WeavingClassVisitor(
         api: Int, cv: ClassWriter,
-        val targets: List<AdviceTargetSpec>,
+        val targets: List<ResolvedAdviceTargetSpec>,
     ) : org.objectweb.asm.ClassVisitor(api, cv) {
 
         private lateinit var className: String
@@ -301,11 +376,11 @@ class Scalpel(
 
         override fun visitMethod(access: Int, name: String, descriptor: String, signature: String?, exceptions: Array<out String>?): MethodVisitor {
             val base = super.visitMethod(access, name, descriptor, signature, exceptions)
-            val matching = targets.filter { matchesDescriptor(it.target.descriptor, descriptor) && it.target.name == name }
+            val matching = targets.filter { matchesDescriptor(it.matchTarget.descriptor, descriptor) && it.matchTarget.name == name }
             if (matching.isEmpty()) return base
             val mergedKinds = mutableSetOf<AdviceKind>()
-            for (s in matching) mergedKinds.addAll(s.kinds)
-            val mergedSpec = AdviceTargetSpec(matching.first().target, mergedKinds, matching.flatMap { it.sites })
+            for (s in matching) mergedKinds.addAll(s.original.kinds)
+            val mergedSpec = AdviceTargetSpec(matching.first().original.target, mergedKinds, matching.flatMap { it.original.sites })
             Forensics.debug("weave inject $className.$name$descriptor kinds=$mergedKinds static=${(access and Opcodes.ACC_STATIC) != 0}")
             return AdviceInjector(api, base, access, name, descriptor, className, mergedSpec)
         }

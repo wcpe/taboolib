@@ -56,12 +56,14 @@ object BodiesClassGenerator {
      * @param originalBytes 目标类的原始字节码（织入前）
      * @param ownerInternalName 目标类 JVM 内部名，如 "com/example/Foo"
      * @param targetMethods 需要生成 body 的方法集合，元素为 (name, descriptor)
+     * @param bodyMethodNames 运行时方法坐标到生成 body 方法名的别名映射；为空时使用 `<name>$BODY_METHOD_SUFFIX`
      * @return bodies 类字节码；若无任何方法可生成则返回 null
      */
     fun generate(
         originalBytes: ByteArray,
         ownerInternalName: String,
         targetMethods: Set<Pair<String, String>>,
+        bodyMethodNames: Map<Pair<String, String>, String> = emptyMap(),
     ): ByteArray? {
         if (targetMethods.isEmpty()) return null
 
@@ -90,7 +92,12 @@ object BodiesClassGenerator {
             if (method.access and ACC_ABSTRACT != 0) continue
             if (method.access and ACC_NATIVE != 0) continue
 
-            val bodyMethod = generateBodyMethod(method, ownerInternalName, privateFields)
+            val bodyMethod = generateBodyMethod(
+                method,
+                ownerInternalName,
+                privateFields,
+                bodyMethodNames[key] ?: (method.name + BODY_METHOD_SUFFIX),
+            )
             if (bodyMethod != null) {
                 bodiesNode.methods.add(bodyMethod)
                 generated++
@@ -111,7 +118,12 @@ object BodiesClassGenerator {
 
     // ─────────────────────────────────────────────────────────────────
 
-    private fun generateBodyMethod(original: MethodNode, ownerInternal: String, privateFields: Map<String, String>): MethodNode? {
+    private fun generateBodyMethod(
+        original: MethodNode,
+        ownerInternal: String,
+        privateFields: Map<String, String>,
+        bodyMethodName: String,
+    ): MethodNode? {
         if (original.access and ACC_STATIC != 0) return null
 
         // 跳过构造函数 / 静态初始化块：
@@ -132,7 +144,7 @@ object BodiesClassGenerator {
 
         val body = MethodNode(
             ACC_PUBLIC or ACC_STATIC,
-            original.name + BODY_METHOD_SUFFIX,
+            bodyMethodName,
             BODY_DESC,
             null,
             original.exceptions?.toTypedArray()

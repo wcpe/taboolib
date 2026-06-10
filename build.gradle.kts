@@ -8,6 +8,14 @@ plugins {
     id("com.github.johnrengelman.shadow") version "7.1.2" apply false
 }
 
+// 当前 fork HEAD 的短哈希（7 位），用于拼出发布版本号 6.3.0-<短哈希>，与上游「每个提交一版」的命名保持一致；
+// 取不到（非 git 环境等）时退化为 unknown，不阻塞构建。
+val gitShortHash: String = runCatching {
+    ProcessBuilder("git", "rev-parse", "--short=7", "HEAD")
+        .directory(rootDir).start()
+        .inputStream.bufferedReader().use { it.readText() }.trim()
+}.getOrNull()?.takeIf { it.isNotEmpty() } ?: "unknown"
+
 subprojects {
     apply(plugin = "java-library")
     apply(plugin = "org.jetbrains.kotlin.jvm")
@@ -92,10 +100,10 @@ subprojects
 
 fun PublishingExtension.applyToSub(subProject: Project) {
     repositories {
-        maven("https://repo.tabooproject.org/repository/releases") {
+        maven("https://maven.wcpe.top/repository/maven-releases/") {
             credentials {
-                username = project.findProperty("taboolibUsername").toString()
-                password = project.findProperty("taboolibPassword").toString()
+                username = project.findProperty("wcpeUsername").toString()
+                password = project.findProperty("wcpePassword").toString()
             }
             authentication {
                 create<BasicAuthentication>("basic")
@@ -123,7 +131,7 @@ fun PublishingExtension.applyToSub(subProject: Project) {
             version = when {
                 project.hasProperty("devLocal") -> "${project.version}-local-dev"
                 project.hasProperty("dev") -> "${project.version}-dev"
-                else -> "${project.version}"
+                else -> "${project.version}-$gitShortHash"
             }
             // 构件
             artifact(subProject.tasks["kotlinSourcesJar"])

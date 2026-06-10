@@ -1,0 +1,45 @@
+name: 发布到 maven.wcpe.top
+
+# 触发：推送到 main 分支自动发布；也支持在 Actions 页手动触发
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+# 同一分支的发布串行排队，避免并发互相覆盖
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          # 仅需 HEAD 即可生成 6.3.0-<短哈希> 版本号
+          fetch-depth: 1
+
+      - name: 配置 JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # 仓库编译依赖 1.21.x NMS（v61）与 Hytale 平台（hytale-server v65=Java 21），
+          # 构建 JDK 必须为 21 才能读取全部依赖字节码；产物仍按 jvmTarget/sourceCompatibility=1.8 输出 Java 8，兼容旧服务端
+          java-version: '21'
+          cache: gradle
+
+      - name: 授予 gradlew 执行权限
+        run: chmod +x ./gradlew
+
+      - name: 发布全部模块
+        env:
+          # Gradle 会把 ORG_GRADLE_PROJECT_xxx 环境变量映射为工程属性 xxx，
+          # 对应 build.gradle.kts 里的 findProperty("wcpeUsername" / "wcpePassword")
+          ORG_GRADLE_PROJECT_wcpeUsername: ${{ secrets.WCPE_USERNAME }}
+          ORG_GRADLE_PROJECT_wcpePassword: ${{ secrets.WCPE_PASSWORD }}
+        run: ./gradlew publish --no-daemon --console=plain --stacktrace

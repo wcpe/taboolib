@@ -123,11 +123,48 @@ class Scalpel(
         target: MethodCoordinate,
         methodSignatures: Set<Pair<String, String>>,
     ): MethodCoordinate {
+        // 原名优先：类中已存在目标原名(名+描述符)时直接用原名
         if (hasMethod(methodSignatures, target.name, target.descriptor)) {
             return target.copy(owner = owner)
         }
-        val (resolvedName, resolvedDesc) = resolver.resolveMethod(owner, target.name, target.descriptor)
+        // 原名不存在 → 走前向 resolver：方法名解析为运行期名，描述符里的类型也逐个由 Mojang 映射到运行期。
+        // resolver.resolveMethod 只映射方法名、描述符原样返回，故描述符必须自己 remap；否则混淆环境下
+        // matchTarget.descriptor 仍是 Mojang 形态，visitor / site / body 三条匹配路都会按描述符漏命中。
+        val resolvedName = resolver.resolveMethod(owner, target.name, target.descriptor).first
+        val resolvedDesc = remapDescriptorTypes(target.descriptor)
         return MethodCoordinate(owner, resolvedName, resolvedDesc)
+    }
+
+    /** 把方法描述符里的每个 `L...;` 类型用前向 resolver 由 Mojang 映射到运行期名；基元/数组前缀原样保留。 */
+    private fun remapDescriptorTypes(descriptor: String): String {
+        val open = descriptor.indexOf('(')
+        val close = descriptor.indexOf(')')
+        if (open < 0 || close < 0 || close < open) return descriptor
+        val args = descriptor.substring(open + 1, close)
+        val ret = descriptor.substring(close + 1)
+        return "(" + remapTypeSeq(args) + ")" + remapTypeSeq(ret)
+    }
+
+    /** 处理一段连续的 JVM 类型描述符（参数序列或单个返回类型），逐类型 remap 引用类型。 */
+    private fun remapTypeSeq(seq: String): String {
+        if (seq.isEmpty() || seq == "*") return seq
+        val sb = StringBuilder(seq.length)
+        var i = 0
+        while (i < seq.length) {
+            val c = seq[i]
+            if (c == '[') { sb.append(c); i++; continue }
+            if (c == 'L') {
+                val semi = seq.indexOf(';', i)
+                if (semi < 0) { sb.append(seq.substring(i)); break }
+                val internal = seq.substring(i + 1, semi)
+                sb.append('L').append(resolver.resolveOwner(internal)).append(';')
+                i = semi + 1
+            } else {
+                // 基元类型（V/Z/B/S/I/J/F/D/C）原样
+                sb.append(c); i++
+            }
+        }
+        return sb.toString()
     }
 
     private fun hasMethod(methodSignatures: Set<Pair<String, String>>, name: String, descriptor: String): Boolean {
@@ -376,7 +413,9 @@ class Scalpel(
 
         override fun visitMethod(access: Int, name: String, descriptor: String, signature: String?, exceptions: Array<out String>?): MethodVisitor {
             val base = super.visitMethod(access, name, descriptor, signature, exceptions)
-            val matching = targets.filter { matchesDescriptor(it.matchTarget.descriptor, descriptor) && it.matchTarget.name == name }
+            // matchTarget 已是「运行期名 + 运行期描述符」（resolveMethodTarget 负责原名优先与描述符 remap），
+            // 故 visitor / site / body 三条路共用同一套匹配口径
+            val matching = targets.filter { it.matchTarget.name == name && matchesDescriptor(it.matchTarget.descriptor, descriptor) }
             if (matching.isEmpty()) return base
             val mergedKinds = mutableSetOf<AdviceKind>()
             for (s in matching) mergedKinds.addAll(s.original.kinds)

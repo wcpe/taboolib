@@ -25,6 +25,20 @@ TabooLib 正式创建于 2018/02/06, 为 Minecraft（Java 版）提供一个跨�
 
 ![](.assets/idea-plugin.png)
 
+## 构件仓库
+
+本 fork 的构件发布于自有 Maven 仓库 `maven.wcpe.top`，坐标组为 `io.izzel.taboolib`，版本号遵循 `6.3.0-<短哈希>`（每个提交一版，最新版本见 [Releases](https://github.com/wcpe/taboolib/releases/latest)）。
+
+```kotlin
+taboolib {
+    env {
+        install(Basic)
+        repoTabooLib = "https://maven.wcpe.top/repository/maven-public/"
+    }
+    version { taboolib = "<版本号>" }
+}
+```
+
 ## 相关链接
 
 + [TabooLib 版本迁移文档 (6.1 -> 6.2)](https://docs.tabooproject.org/migration/migration-6-1-to-6-2)

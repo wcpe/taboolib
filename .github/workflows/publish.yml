@@ -43,3 +43,112 @@ jobs:
           ORG_GRADLE_PROJECT_wcpeUsername: ${{ secrets.WCPE_USERNAME }}
           ORG_GRADLE_PROJECT_wcpePassword: ${{ secrets.WCPE_PASSWORD }}
         run: ./gradlew publish --no-daemon --console=plain --stacktrace
+
+  # Maven 发布成功后，再发布 GitHub Release：
+  # 以「每个提交一版」的 6.3.0-<短哈希> 为 tag，标记为仓库最新发布，
+  # 正文按提交类型（Conventional Commits）归纳上一发布至当前的中文变更日志。
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      # 仅本 job 需要写权限以创建 Release 与版本 tag，其余 job 保持只读，遵循最小权限
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          # 归纳变更日志需要完整历史与 tag，才能对比上一发布
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 生成版本号与变更日志
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # 版本号与 build.gradle.kts 保持一致：<gradle.properties 的 version>-<7 位短哈希>
+          base="$(grep -E '^version=' gradle.properties | head -1 | cut -d= -f2 | tr -d '[:space:]')"
+          short="$(git rev-parse --short=7 HEAD)"
+          tag="${base}-${short}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          # 上一发布：取仓库当前「最新 Release」的 tag 作为变更日志起点；首次发布则无
+          prev_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+          if [ -n "${prev_tag}" ] && git rev-parse -q --verify "refs/tags/${prev_tag}^{commit}" >/dev/null; then
+            log_args=("${prev_tag}..HEAD")
+            first_release=false
+          else
+            prev_tag=""
+            log_args=(-n 1 HEAD)
+            first_release=true
+          fi
+
+          notes="$(mktemp)"
+          {
+            echo "## ${tag}"
+            echo
+            if [ "${first_release}" = "true" ]; then
+              echo "首次发布（仅记录当前提交，后续版本将自动对比上一发布）。"
+            else
+              echo "对比上一发布 \`${prev_tag}\` 的变更："
+            fi
+            echo
+          } > "${notes}"
+
+          # 提交类型 -> 中文分节标题；按下列顺序输出
+          order=(feat fix perf refactor docs style test build ci chore revert other)
+          declare -A title=(
+            [feat]="✨ 新功能" [fix]="🐛 修复" [perf]="⚡ 性能优化" [refactor]="♻️ 重构"
+            [docs]="📝 文档" [style]="💄 代码风格" [test]="✅ 测试" [build]="📦 构建"
+            [ci]="👷 持续集成" [chore]="🔧 杂项" [revert]="⏪ 回滚" [other]="📌 其他"
+          )
+          declare -A bucket
+
+          # 用制表符(0x09)分隔短哈希与标题；提交标题一般不含制表符
+          re='^([a-zA-Z]+)(\([^)]*\))?!?:'
+          while IFS=$'\t' read -r h s; do
+            [ -n "${h}" ] || continue
+            if [[ "${s}" =~ $re ]]; then
+              t="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+            else
+              t="other"
+            fi
+            [ -n "${title[${t}]:-}" ] || t="other"
+            bucket[${t}]+="- ${s} (\`${h}\`)"$'\n'
+          done < <(git log --no-merges --pretty=format:'%h%x09%s' "${log_args[@]}")
+
+          for t in "${order[@]}"; do
+            if [ -n "${bucket[${t}]:-}" ]; then
+              {
+                echo "### ${title[${t}]}"
+                echo
+                printf '%s\n' "${bucket[${t}]}"
+              } >> "${notes}"
+            fi
+          done
+
+          if [ "${first_release}" != "true" ]; then
+            echo "**完整变更**: https://github.com/${GITHUB_REPOSITORY}/compare/${prev_tag}...${tag}" >> "${notes}"
+          fi
+
+          echo "notes_file=${notes}" >> "$GITHUB_OUTPUT"
+
+      - name: 创建 Release 并标记为最新
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.notes.outputs.tag }}"
+          notes_file="${{ steps.notes.outputs.notes_file }}"
+          # 同一提交重跑时幂等：已存在则仅更新正文，否则在当前提交新建 tag 并发布
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release edit "${tag}" --notes-file "${notes_file}" --latest
+          else
+            gh release create "${tag}" \
+              --title "${tag}" \
+              --notes-file "${notes_file}" \
+              --target "${GITHUB_SHA}" \
+              --latest
+          fi

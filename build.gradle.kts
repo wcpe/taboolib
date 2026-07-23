@@ -61,6 +61,22 @@ subprojects {
         useJUnitPlatform()
     }
 
+    // Gradle 8.9：test 类路径消费依赖工程 shadowJar（classifier 为空）时须显式 dependsOn
+    afterEvaluate {
+        tasks.withType<Test>().configureEach {
+            val shadowTasks = configurations.findByName("testImplementation")?.dependencies
+                ?.filterIsInstance<org.gradle.api.artifacts.ProjectDependency>()
+                ?.mapNotNull { dep ->
+                    val depProject = dep.dependencyProject
+                    depProject.tasks.findByName("shadowJar")?.let { depProject.tasks.named("shadowJar") }
+                }
+                ?: emptyList()
+            if (shadowTasks.isNotEmpty()) {
+                dependsOn(shadowTasks)
+            }
+        }
+    }
+
     tasks.withType<ShadowJar> {
         archiveClassifier.set("")
         relocate("org.tabooproject", "taboolib.library")

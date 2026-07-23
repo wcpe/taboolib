@@ -517,8 +517,8 @@ class NMSScoreboardImpl : NMSScoreboard() {
     // 每个策略 lambda 先用空 JSON 测试可用性，成功后返回函数引用
     private val jsonComponentImpl = versionAdaptor<(String) -> IChatBaseComponent>(
         {
-            val test = NMSChatSerializer16::class.java.invokeMethod<Any>("fromJson", "{\"text\":\"\"}", isStatic = true)!!
-            { text -> NMSChatSerializer16::class.java.invokeMethod<Any>("fromJson", text, isStatic = true)!! as IChatBaseComponent }
+            val test = NMSChatSerializer16::class.java.invokeMethod<Any>("b", "{\"text\":\"\"}", isStatic = true)!!
+            { text -> NMSChatSerializer16::class.java.invokeMethod<Any>("b", text, isStatic = true)!! as IChatBaseComponent }
         },
         {
             val test = NMSChatSerializer16.b("{\"text\":\"\"}")!!

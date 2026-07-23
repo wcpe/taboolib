@@ -18,6 +18,8 @@ dependencies {
     implementation("com.electronwill.night-config:core-conversion:6.0.0")
 
     // 测试
+    testImplementation(project(":common"))
+    testImplementation(project(":common-platform-api"))
     testImplementation(project(":common-util"))
     testImplementation("org.yaml:snakeyaml:2.6")
     testImplementation("com.typesafe:config:1.4.3")

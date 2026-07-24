@@ -29,6 +29,7 @@ subprojects {
         maven("https://maven.aliyun.com/repository/central")
         maven("https://repo.codemc.io/repository/nms/")
         maven("https://repo.tabooproject.org/repository/releases")
+        maven("https://maven.wcpe.top/repository/maven-public")
         mavenLocal()
         mavenCentral()
     }
@@ -39,16 +40,17 @@ subprojects {
         compileOnly("com.google.guava:guava:21.0")
         compileOnly("com.google.code.gson:gson:2.8.7")
         compileOnly("org.apache.commons:commons-lang3:3.5")
-        compileOnly("org.tabooproject.reflex:reflex:1.2.4")
-        compileOnly("org.tabooproject.reflex:analyser:1.2.4")
+        compileOnly("org.tabooproject.reflex:reflex:1.2.6-c62cfeb")
+        compileOnly("org.tabooproject.reflex:analyser:1.2.6-c62cfeb")
+
         // 测试依赖
         testImplementation(kotlin("stdlib"))
         testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
         testImplementation("com.google.guava:guava:21.0")
         testImplementation("com.google.code.gson:gson:2.8.7")
         testImplementation("org.apache.commons:commons-lang3:3.5")
-        testImplementation("org.tabooproject.reflex:reflex:1.2.4")
-        testImplementation("org.tabooproject.reflex:analyser:1.2.4")
+        testImplementation("org.tabooproject.reflex:reflex:1.2.6-c62cfeb")
+        testImplementation("org.tabooproject.reflex:analyser:1.2.6-c62cfeb")
         testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.8.1")
         testImplementation("org.junit.jupiter:junit-jupiter-api:5.8.1")
     }
@@ -116,7 +118,7 @@ subprojects
 
 fun PublishingExtension.applyToSub(subProject: Project) {
     repositories {
-        maven("https://maven.wcpe.top/repository/maven-releases/") {
+        maven("https://maven.wcpe.top/repository/maven-tabooproject-release/") {
             credentials {
                 username = project.findProperty("wcpeUsername").toString()
                 password = project.findProperty("wcpePassword").toString()

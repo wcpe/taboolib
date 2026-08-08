@@ -23,4 +23,6 @@ package taboolib.module.incision.annotation
 annotation class InsnPattern(
     /** 顺序匹配的步骤数组；留空表示不启用模式约束。 */
     val steps: Array<Step> = [],
+    /** 是否允许步骤之间跨过不相关指令；必须显式选择旧的有序子序列语义。 */
+    val mode: PatternMode = PatternMode.CONTIGUOUS,
 )

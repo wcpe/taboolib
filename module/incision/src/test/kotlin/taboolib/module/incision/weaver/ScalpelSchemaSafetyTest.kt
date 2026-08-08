@@ -202,7 +202,7 @@ class ScalpelSchemaSafetyTest {
         val hasDispatchCall = instructions.filterIsInstance<MethodInsnNode>().any {
             it.owner == "io/izzel/incision/bridge/IncisionBridge" &&
                 it.name == "dispatch" &&
-                it.desc == "(Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
+                it.desc == "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
         }
         val hasOriginalDispatchKey = instructions.filterIsInstance<LdcInsnNode>().any {
             it.cst == "${target.signature}@LEAD"
@@ -271,7 +271,7 @@ class ScalpelSchemaSafetyTest {
         val hasDispatchCall = instructions.filterIsInstance<MethodInsnNode>().any {
             it.owner == "io/izzel/incision/bridge/IncisionBridge" &&
                 it.name == "dispatch" &&
-                it.desc == "(Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
+                it.desc == "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
         }
         val hasOriginalDispatchKey = instructions.filterIsInstance<LdcInsnNode>().any {
             it.cst == target.signature

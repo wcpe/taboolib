@@ -1,5 +1,6 @@
 package taboolib.module.incision.weaver.site
 
+import taboolib.module.incision.annotation.MatchMode
 import taboolib.module.incision.annotation.Trim
 import taboolib.module.incision.api.Anchor
 import taboolib.module.incision.api.MethodCoordinate
@@ -14,6 +15,7 @@ import taboolib.module.incision.weaver.site.pattern.SitePattern
  * @property ownerPattern 锚点目标的 owner（internalName）；空则匹配所有
  * @property namePattern  锚点目标的 name；空则匹配所有
  * @property descPattern  锚点目标的 desc；空则匹配所有
+ * @property matchMode 三段目标坐标的匹配方式；GLOB 覆盖任意位置的 `*` 与单字符 `?`。
  * @property shift   相对锚点的偏移（BEFORE / AFTER）
  * @property ordinal 第 N 次出现（0 起步），-1 表示全部
  * @property offset  沿 [shift] 方向跨越的指令条数；0 表示就在锚点处。
@@ -45,8 +47,12 @@ data class SiteSpec(
     val ownerPattern: String = "",
     val namePattern: String = "",
     val descPattern: String = "",
+    val matchMode: MatchMode = MatchMode.EXACT,
     val shift: Shift = Shift.BEFORE,
     val ordinal: Int = -1,
+    /** 织入前验证最终锚点数量；越界时整类 weave 失败并由事务后端回滚。 */
+    val minMatches: Int = 1,
+    val maxMatches: Int = 1,
     val kind: AdviceKind,
     val target: MethodCoordinate,
     val offset: Int = 0,
@@ -62,3 +68,23 @@ data class SiteSpec(
     val hostMethodDescriptor: String = "",
     val hostIsStatic: Boolean = false,
 )
+
+/**
+ * Site 三段坐标共用的匹配入口。放在 IR 层可确保 streaming 与 recording 两条织入路径
+ * 使用完全相同的 GLOB 规则，避免扫描期命中而实际织入零命中。
+ */
+internal fun SiteSpec.matchesPattern(pattern: String, value: String): Boolean {
+    if (pattern.isEmpty()) return true
+    if (matchMode == MatchMode.EXACT) return pattern == value
+    val regex = buildString(pattern.length * 2) {
+        append('^')
+        for (char in pattern) when (char) {
+            '*' -> append(".*")
+            '?' -> append('.')
+            '.', '(', ')', '[', ']', '{', '}', '+', '^', '$', '|', '\\' -> append('\\').append(char)
+            else -> append(char)
+        }
+        append('$')
+    }
+    return Regex(regex).matches(value)
+}

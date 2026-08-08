@@ -23,11 +23,18 @@ import taboolib.module.incision.api.Anchor
 @Retention(AnnotationRetention.RUNTIME)
 @MustBeDocumented
 annotation class Trim(
-    /** 宿主方法描述符，格式为 `类#方法名(参数)返回`。 */
-    val method: String,
+    /** 兼容的宿主 Scope；非空时优先于 [method] 和 [pointcut]。 */
+    val scope: String = "",
 
     /** 改写目标类型：参数、返回值或局部变量。 */
     val kind: Kind,
+
+    /** v2 结构化宿主选择器。 */
+    val pointcut: Pointcut = Pointcut(),
+
+    /** 旧版宿主描述符别名；只在 [scope] 为空时优先于 [pointcut]。 */
+    @Deprecated("请使用 scope 或 pointcut")
+    val method: String = "",
 
     /** 参数索引（kind=ARG）或局部变量槽位（kind=VAR）；返回值场景通常保持默认。 */
     val index: Int = 0,
@@ -39,7 +46,7 @@ annotation class Trim(
     val pattern: InsnPattern = InsnPattern([]),
 
     /** 命名标签，可供 DSL、诊断输出或后续匹配事件引用。 */
-    val where: String = "",
+    val predicate: String = "",
 ) {
 
     /** Trim 支持的值类别。 */

@@ -24,12 +24,12 @@ import taboolib.module.incision.weaver.site.SiteSpec
  *
  * 旧方法委托到新方法 + 一次 `list.accept(mv)` 回放以保持行为一致，避免逻辑双维护。
  *
- * 所有 Graft/Bypass/Trim 最终都调 `IncisionBridge.dispatch(sig, self, args)`。
+ * 所有 Graft/Bypass/Trim 最终都调 `IncisionBridge.dispatch(ownerClass, sig, self, args)`。
  */
 object DispatcherEmitter {
 
     private const val BRIDGE = "io/izzel/incision/bridge/IncisionBridge"
-    private const val DISPATCH_DESC = "(Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
+    private const val DISPATCH_DESC = "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
 
     /**
      * 生成 dispatch 调用的 targetSig。
@@ -49,10 +49,12 @@ object DispatcherEmitter {
     /**
      * 发射 dispatcher 调用，栈顶留下 Object 返回值。
      *
-     * 产物序列：`LDC sig · self · args[] · INVOKESTATIC dispatch`
+     * 产物序列：`LDC ownerClass · LDC sig · self · args[] · INVOKESTATIC dispatch`。
+     * Class 常量携带宿主 defining ClassLoader，避免 Bridge 依赖 TCCL 或最后注册的 dispatcher。
      */
     fun buildDispatch(site: SiteSpec): InsnList {
         val list = InsnList()
+        list.add(LdcInsnNode(Type.getObjectType(site.target.owner)))
         list.add(LdcInsnNode(sigOf(site)))
         emitSelfLoad(list, site)
         emitArgsArray(list, site)
@@ -69,6 +71,7 @@ object DispatcherEmitter {
 
     fun buildBypassDispatch(site: SiteSpec): InsnList {
         val list = InsnList()
+        list.add(LdcInsnNode(Type.getObjectType(site.target.owner)))
         list.add(LdcInsnNode(sigOf(site)))
         emitSelfLoad(list, site)
         emitArgsArray(list, site)

@@ -34,7 +34,7 @@ object TabooLibNmsResolver : NameResolver {
             val isMojang = readBoolProp(mvc, instance, "isMojangMapping") ?: false
 
             val implClassName = when {
-                isUnobf -> "taboolib.module.nms.remap.RemapTranslationUnobfsucated"
+                isUnobf -> "taboolib.module.nms.remap.RemapTranslationUnobfuscated"
                 isUniCB -> "taboolib.module.nms.remap.RemapTranslationTabooLib"
                 else -> "taboolib.module.nms.remap.RemapTranslationLegacy"
             }
@@ -82,13 +82,13 @@ object TabooLibNmsResolver : NameResolver {
         val d = delegate ?: return name to desc
         return try {
             // 走 owner 的实际类名（已转译）调用 Remapper.mapMethodName(owner, name, descriptor)
-            val resolvedOwner = resolveOwner(owner)
             val m = mapMethodNameMethod(d) ?: return name to desc
-            val mapped = m.invoke(d, resolvedOwner, name, desc) as? String ?: name
+            val mappedDesc = resolveDescriptor(desc)
+            val mapped = m.invoke(d, owner, name, desc) as? String ?: name
             if (mapped != name) {
                 Forensics.debug("resolveMethod: $owner.$name$desc → $mapped")
             }
-            mapped to desc
+            mapped to mappedDesc
         } catch (t: Throwable) {
             Forensics.warn("resolveMethod 失败: $owner.$name$desc — ${t.javaClass.name}: ${t.message}")
             name to desc
@@ -98,13 +98,13 @@ object TabooLibNmsResolver : NameResolver {
     override fun resolveField(owner: String, name: String, desc: String): Pair<String, String> {
         val d = delegate ?: return name to desc
         return try {
-            val resolvedOwner = resolveOwner(owner)
             val m = mapFieldNameMethod(d) ?: return name to desc
-            val mapped = m.invoke(d, resolvedOwner, name, desc) as? String ?: name
+            val mappedDesc = resolveDescriptor(desc)
+            val mapped = m.invoke(d, owner, name, desc) as? String ?: name
             if (mapped != name) {
                 Forensics.debug("resolveField: $owner.$name:$desc → $mapped")
             }
-            mapped to desc
+            mapped to mappedDesc
         } catch (t: Throwable) {
             Forensics.warn("resolveField 失败: $owner.$name:$desc — ${t.javaClass.name}: ${t.message}")
             name to desc

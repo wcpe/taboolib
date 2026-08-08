@@ -102,7 +102,7 @@ import taboolib.module.incision.annotation.Surgeon
 @Surgeon(priority = 50)
 object DemoSurgeon {
 
-    @Lead("method:top.example.Target#greet(java.lang.String)java.lang.String")
+    @Lead(scope = "method:top.example.Target#greet(java.lang.String)java.lang.String")
     @Operation(id = "greet-lead", priority = 100)
     fun beforeGreet(theatre: taboolib.module.incision.api.Theatre) {
         println("before greet: ${theatre.args[0]}")
@@ -116,6 +116,26 @@ object DemoSurgeon {
 - 扫描期会把方法翻译成 `AdviceEntry`，注册进 dispatcher，再触发织入
 - 方法级 `@Operation` 可以覆盖类级默认优先级和启用状态
 - 适合稳定、长期、声明式的 patch，是模块对外的首选模式
+
+### Scope 与 Pointcut
+
+普通精确方法优先使用一行 `scope`。需要 CLASS/FIELD 过滤、GLOB 或布尔组合时，再使用结构化
+`pointcut`。NMS 坐标无需声明命名空间：Mojang、Spigot 和旧版本号包名统一交给 NMSProxy 同源
+resolver 自动翻译，普通非 NMS 坐标保持不变。两者可以共存于 API，但同一 advice 同时填写时会输出警告，并固定采用
+`scope`、忽略 `pointcut`，不会隐式合并两套选择条件。Graft/Bypass/Trim 的旧 `method` 参数继续作为
+兼容别名，优先级位于 `scope` 之后、`pointcut` 之前。
+
+```kotlin
+@Lead(
+    pointcut = Pointcut(anyOf = [Selector(
+        kind = SelectorKind.METHOD,
+        owner = "net/minecraft/server/MinecraftServer",
+        name = "getPlayerCount",
+        descriptor = "()I"
+    )])
+)
+fun beforeNms(theatre: Theatre) = Unit
+```
 
 ## Advice 类型总表
 
@@ -195,11 +215,154 @@ object DemoSurgeon {
 - 支持自定义 matcher FQCN
 - matcher 解析失败会回退到 Noop matcher，这通常意味着该 advice 不会按预期筛选
 
-### remap
+### NMS 跨版本 remap
 
-- 用户声明可以写逻辑上的 NMS owner/name/desc
-- 运行时交给 `RemapRouter` / `TabooLibNmsResolver` 解析到实际类名
-- 安装 weaver 时会先做 owner 级映射，再对已加载类做 retransform
+Incision 的 NMS 目标不需要 `Namespace`。调用者只写一套逻辑坐标，可以使用任意一个受支持版本的
+Mojang、Spigot 或旧版本号包名；运行时通过 `RemapRouter` / `TabooLibNmsResolver` 转换成当前
+服务端真实坐标。
+
+转换链覆盖：
+
+1. 宿主类和 Site 目标的 `owner`
+2. 方法名和字段名
+3. descriptor 中的所有对象类型与对象数组类型
+4. Site 的 `INVOKE`、`FIELD_GET`、`FIELD_PUT` 和 `NEW` 目标
+
+当前环境会自动选择 `RemapTranslationLegacy`、`RemapTranslationTabooLib` 或
+`RemapTranslationUnobfuscated`。非 NMS 坐标原样返回；Incision 只转换声明坐标，不会使用
+`ClassRemapper` 再次改写整份服务端字节码。
+
+#### 使用 Mojang 名称声明 NMS 方法
+
+推荐新代码使用 Mojang 名称和 JVM descriptor：
+
+```kotlin
+@Surgeon
+object MinecraftServerHook {
+
+    @Lead(
+        pointcut = Pointcut(
+            anyOf = [
+                Selector(
+                    kind = SelectorKind.METHOD,
+                    owner = "net/minecraft/server/MinecraftServer",
+                    name = "getPlayerCount",
+                    descriptor = "()I",
+                ),
+            ],
+        ),
+    )
+    fun beforeGetPlayerCount(theatre: Theatre) {
+        val minecraftServer: Any? = theatre.self
+        // handler 不直接引用某个版本的 NMS Class，确保自身可以在所有目标版本完成类加载。
+        println("即将读取在线人数: $minecraftServer")
+    }
+}
+```
+
+同一声明可以映射到旧版本号包、Spigot 映射、Mojang Mapping 和 Paper 1.20.6+ unobfuscated
+环境。`owner` 必须使用斜杠形式的 JVM internal name，方法 descriptor 必须使用 JVM 格式；例如
+`()I` 表示无参数并返回 `int`。
+
+#### 使用旧 CraftBukkit 坐标声明 Site
+
+旧版本号包名也可以作为逻辑坐标。以下写法来自 Adyeshach 集成测试：宿主是普通插件类，Site
+目标则故意使用 1.16.3 的 CraftBukkit/NMS 名称。
+
+```kotlin
+@Graft(
+    pointcut = Pointcut(
+        anyOf = [
+            Selector(
+                kind = SelectorKind.METHOD,
+                owner = "ink/ptms/adyeshach/impl/nms/DefaultMinecraftHelper",
+                name = "literalChatBaseComponent",
+                descriptor = "(Ljava/lang/String;)Ljava/lang/Object;",
+            ),
+        ],
+    ),
+    site = Site(
+        anchor = Anchor.INVOKE,
+        target = Selector(
+            kind = SelectorKind.METHOD,
+            owner = "org/bukkit/craftbukkit/v1_16_R3/util/CraftChatMessage",
+            name = "fromString",
+            descriptor = "(Ljava/lang/String;)[Lnet/minecraft/server/v1_16_R3/IChatBaseComponent;",
+        ),
+        ordinal = 0,
+    ),
+)
+fun beforeCraftChatMessage(theatre: Theatre) {
+    // 在转换后的 CraftChatMessage.fromString 调用点执行。
+}
+```
+
+在现代服务端上，owner 和 descriptor 中的旧名称会一起转换，例如
+`IChatBaseComponent` 可以转换为当前环境的 `net/minecraft/network/chat/Component`。不能只转换
+owner 而保留旧 descriptor，否则重载解析会零命中。
+
+#### Site 的 SelectorKind 对应关系
+
+```kotlin
+// 方法调用指令
+Site(
+    anchor = Anchor.INVOKE,
+    target = Selector(kind = SelectorKind.METHOD, owner = "...", name = "...", descriptor = "(...)..."),
+)
+
+// 字段读取或写入指令
+Site(
+    anchor = Anchor.FIELD_GET,
+    target = Selector(kind = SelectorKind.FIELD, owner = "...", name = "...", descriptor = "I"),
+)
+
+// 对象创建指令
+Site(
+    anchor = Anchor.NEW,
+    target = Selector(kind = SelectorKind.CLASS, owner = "net/minecraft/..."),
+)
+```
+
+`ordinal = 0` 默认只选择第一个过滤后命中；需要选择全部调用点时必须显式填写
+`ordinal = -1`。宿主 Pointcut 和 Site 都默认要求 `minMatches = 1, maxMatches = 1`，零命中或
+过量命中会拒绝安装。
+
+#### 需要声明多个 Selector 的情况
+
+自动 remap 解决的是名称空间和映射名称差异，不能凭空兼容 Minecraft 自身的结构性变化，例如：
+
+- 方法移动到另一个类
+- 参数数量或返回类型发生变化
+- 一个方法被拆分或在某个版本被删除
+
+这种情况使用 `anyOf` 描述每一种真实结构，并用命中数量约束保证当前环境只选择预期目标：
+
+```kotlin
+pointcut = Pointcut(
+    anyOf = [
+        Selector(kind = SelectorKind.METHOD, owner = "net/minecraft/.../OldOwner", name = "run", descriptor = "()V"),
+        Selector(kind = SelectorKind.METHOD, owner = "net/minecraft/.../NewOwner", name = "run", descriptor = "(Z)V"),
+    ],
+    minMatches = 1,
+    maxMatches = 1,
+)
+```
+
+#### Incision 与 NMSProxy 的职责边界
+
+Selector 自动映射只保证“找到并织入正确的 NMS 方法/字段/调用点”，不会让 handler 中硬编码的
+某版本 NMS 类型自动变得可加载。需要跨版本的 handler 应使用 `Theatre.self`、`Theatre.args` 和
+`Any?` 保持类型解耦；需要类型化执行复杂 NMS 操作时，使用 TabooLib `NMSProxy` 承担代理类的
+跨版本转换。
+
+```text
+Incision Selector -> 跨版本定位切入点
+NMSProxy           -> 跨版本执行具体 NMS 操作
+```
+
+不要同时填写 `scope` 和 `pointcut`：非空 `scope` 的优先级更高，扫描器会警告并忽略
+`pointcut`。NMS 新代码建议只使用结构化 Pointcut/Site，便于完整映射 descriptor 和执行命中数量
+校验。
 
 ### `@KotlinTarget`
 
@@ -300,9 +463,10 @@ class:org.bukkit.entity.Player & method:org.bukkit.entity.Player#kickPlayer(*)
 - 常量折叠、编译器优化、Kotlin 桥接方法都会影响结果
 - 当前测试矩阵已覆盖 `ICONST/LDC/NEW/INVOKE/GOTO/ARRAYLENGTH/PUTFIELD/...`
 
-### 4. `where` 谓词
+### 4. `predicate` 谓词
 
-`where` 适合做命中后的二次筛选，不替代描述符和锚点。
+`predicate` 适合做命中后的二次筛选，不替代 scope、pointcut 和锚点。表达式编译失败时拒绝注册，
+运行异常时按“不匹配”处理，避免过滤器故障扩大织入范围。
 
 已覆盖能力：
 
@@ -317,8 +481,8 @@ class:org.bukkit.entity.Player & method:org.bukkit.entity.Player#kickPlayer(*)
 
 建议：
 
-- 先用 descriptor / scope 缩小范围，再用 `where`
-- `where` 写复杂时优先加对应测试用例，不要只靠肉眼判断
+- 先用 scope / pointcut 缩小范围，再用 `predicate`
+- `predicate` 写复杂时优先加对应测试用例，不要只靠肉眼判断
 
 ## 设计文档
 
@@ -545,3 +709,11 @@ object EssentialsListHook {
   - `Incision-Test` 对应用例与 `CaseDocs`
 - 修改 bytecode matching、offset、anchor 逻辑时，优先跑对应矩阵，而不是只看单个 case
 - 看到运行时 warning 时，先判断它是不是测试刻意覆盖的 fallback 样本，再决定是否修复
+
+## 验证报告
+
+- `SCOPE-TO-POINTCUT-MIGRATION.md`：旧 Scope 单行字符串的兼容边界，以及组合表达式、Site 和 NMS 坐标的 Pointcut 迁移方法。
+- `TEST-REPORT-2026-07-28.md`：Java 8～26、Paper/Spigot、Instrumentation/JVMTI 功能矩阵。
+- `JMH-PERFORMANCE-REPORT-2026-07-28.md`：正式的六服务端、四种 JVM、双 Backend JMH 纳秒级性能矩阵。
+- `performance/scripts/`：JMH 服务端矩阵与 Python 图表生成脚本的可复现归档。
+- `PERFORMANCE-REPORT-2026-07-28.md`：Paper 1.21.11/JVMTI 上 `System.nanoTime()` 批量计时的历史对照结果。

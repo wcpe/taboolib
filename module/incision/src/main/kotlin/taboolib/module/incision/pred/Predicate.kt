@@ -3,7 +3,8 @@ package taboolib.module.incision.pred
 /**
  * 编译后的谓词。
  *
- * 由 [PredCompiler] 从 [PredAst] 生成 ASM 字节码并装载到目标 ClassLoader 后实例化。
+ * 由 [PredCompiler] 从 [PredAst] 生成 ASM 字节码，并装载到以 advice ClassLoader 为 parent 的
+ * 专用生成类加载器后实例化。专用 loader 避免依赖受模块封装限制的反射 defineClass 或 JVMTI。
  *
  * 实现类要求：
  * - 无状态、线程安全（dispatcher 多线程并发 `test`）

@@ -24,6 +24,7 @@ import taboolib.module.incision.api.Anchor
 import taboolib.module.incision.api.Shift
 import taboolib.module.incision.runtime.AdviceKind
 import taboolib.module.incision.weaver.site.SiteSpec
+import taboolib.module.incision.weaver.site.matchesPattern
 import taboolib.module.incision.weaver.site.emitter.DispatcherEmitter
 import taboolib.module.incision.weaver.site.matcher.FieldMatcher
 import taboolib.module.incision.weaver.site.matcher.InvokeMatcher
@@ -344,9 +345,10 @@ class SiteWeaver(private val sites: List<SiteSpec>) {
             for (i in sites.indices) {
                 val site = sites[i]
                 if (site.anchor != anchor) continue
-                val ownerOk = site.ownerPattern.isEmpty() || site.ownerPattern == owner
-                val nameOk = site.namePattern.isEmpty() || site.namePattern == name
-                val descOk = site.descPattern.isEmpty() || site.descPattern == descriptor
+                // streaming 路径必须与 matcher/recording 路径共享完整 GLOB 语义。
+                val ownerOk = site.matchesPattern(site.ownerPattern, owner)
+                val nameOk = site.matchesPattern(site.namePattern, name)
+                val descOk = site.matchesPattern(site.descPattern, descriptor)
                 if (!ownerOk || !nameOk || !descOk) continue
                 val idx = counters[i]
                 counters[i] = idx + 1
@@ -462,9 +464,10 @@ class SiteWeaver(private val sites: List<SiteSpec>) {
             } catch (t: Throwable) {
                 taboolib.module.incision.diagnostic.Forensics.error(
                     "SiteWeaver tree pipeline failed: ${t::class.java.name}: ${t.message} " +
-                        "| method=$name$desc sites=${sites.size}; fallback to raw accept",
+                        "| method=$name$desc sites=${sites.size}; reject weave",
                     t,
                 )
+                throw IllegalStateException("Site weave failed for $name$desc", t)
             }
             this.accept(downstream)
         }
@@ -487,7 +490,7 @@ class SiteWeaver(private val sites: List<SiteSpec>) {
 
             val opcodeSeqEntries: List<OpcodeSeqMatcher.Entry> = opcodeSeqSites.mapNotNull { s ->
                 val p = s.pattern
-                if (p is SitePattern.OpcodeSeq) OpcodeSeqMatcher.Entry(s, p.steps) else null
+                if (p is SitePattern.OpcodeSeq) OpcodeSeqMatcher.Entry(s, p.steps, p.mode) else null
             }
             val opcodeSeqMatcher = OpcodeSeqMatcher(opcodeSeqEntries)
             val planner = PlannerDispatcher()
@@ -528,6 +531,19 @@ class SiteWeaver(private val sites: List<SiteSpec>) {
 
             val headEvents = terminalMatcher.matchHead()
             val headAnchor = findHeadInsertionAnchor(nodes)
+
+            // Site 数量约束是安装事务的一部分：任一声明越界都抛出，让后端撤销 transformer，
+            // 不能只跳过该 Site 后仍把类登记为 installed。
+            val matchCounts = HashMap<SiteSpec, Int>()
+            plans.forEach { matchCounts.merge(it.plan.site, 1, Int::plus) }
+            headEvents.forEach { matchCounts.merge(it.siteSpec, 1, Int::plus) }
+            for (site in sites) {
+                val count = matchCounts[site] ?: 0
+                val max = if (site.maxMatches < 0) Int.MAX_VALUE else site.maxMatches
+                require(count in site.minMatches..max) {
+                    "Site 命中数越界: advice=${site.adviceId} actual=$count expected=${site.minMatches}..${site.maxMatches}"
+                }
+            }
 
             // 同 anchor 多 plan 的处理顺序：把 BYPASS 排到最后。
             // 原因：BYPASS 的实现是 insertBefore(anchor, em) + remove(anchor) —— 一旦先于 GRAFT AFTER
@@ -777,10 +793,10 @@ class SiteWeaver(private val sites: List<SiteSpec>) {
                 runPipeline()
             } catch (t: Throwable) {
                 taboolib.module.incision.diagnostic.Forensics.error(
-                    "SiteWeaver recording pipeline failed: ${t::class.java.name}: ${t.message} | sites=${sites.size} actions=${actions.size}; fallback to raw replay",
+                    "SiteWeaver recording pipeline failed: ${t::class.java.name}: ${t.message} | sites=${sites.size} actions=${actions.size}; reject weave",
                     t,
                 )
-                Replayer(actions).replay(downstream)
+                throw IllegalStateException("Site recording weave failed", t)
             }
         }
 
@@ -799,7 +815,7 @@ class SiteWeaver(private val sites: List<SiteSpec>) {
 
             val opcodeSeqEntries: List<OpcodeSeqMatcher.Entry> = opcodeSeqSites.mapNotNull { s ->
                 val p = s.pattern
-                if (p is SitePattern.OpcodeSeq) OpcodeSeqMatcher.Entry(s, p.steps) else null
+                if (p is SitePattern.OpcodeSeq) OpcodeSeqMatcher.Entry(s, p.steps, p.mode) else null
             }
             val opcodeSeqMatcher = OpcodeSeqMatcher(opcodeSeqEntries)
 
@@ -843,6 +859,18 @@ class SiteWeaver(private val sites: List<SiteSpec>) {
 
             val headEvents = terminalMatcher.matchHead()
             val headInsertIdx = firstRealInsnIndex(actions)
+
+            // recording 与 tree 路径执行同一条数量契约，避免不同 JVM/ASM 能力下行为漂移。
+            val matchCounts = HashMap<SiteSpec, Int>()
+            indexedPlans.forEach { matchCounts.merge(it.plan.site, 1, Int::plus) }
+            headEvents.forEach { matchCounts.merge(it.siteSpec, 1, Int::plus) }
+            for (site in sites) {
+                val count = matchCounts[site] ?: 0
+                val max = if (site.maxMatches < 0) Int.MAX_VALUE else site.maxMatches
+                require(count in site.minMatches..max) {
+                    "Site 命中数越界: advice=${site.adviceId} actual=$count expected=${site.minMatches}..${site.maxMatches}"
+                }
+            }
 
             // 倒序插入避免索引漂移
             val sortedPlans = indexedPlans.sortedByDescending { it.index }

@@ -3,6 +3,7 @@ package taboolib.module.incision.api
 import org.tabooproject.reflex.Reflex.Companion.invokeMethod
 import taboolib.common.util.unsafeLazy
 import taboolib.module.incision.diagnostic.Forensics
+import kotlin.reflect.KClass
 
 /**
  * 版本匹配器 —— 抽象"如何取当前版本"以及"如何判断版本是否落在区间内"。
@@ -25,7 +26,7 @@ interface VersionMatcher {
      * 默认实现：dot-decimal 段比较；缺失段视为 0。
      */
     fun matches(start: String, end: String): Boolean {
-        val cur = current() ?: return true
+        val cur = current() ?: return false
         if (start.isNotBlank() && compare(cur, start) < 0) return false
         if (end.isNotBlank() && compare(cur, end) > 0) return false
         return true
@@ -68,7 +69,7 @@ object MinecraftVersionMatcher : VersionMatcher {
             val versionString = Class.forName("org.bukkit.Bukkit").invokeMethod<Any>("getServer", isStatic = true)!!.invokeMethod<String>("getVersion")!!
             val version = versionString.split("MC:")[1]
             version.substring(0, version.length - 1).split(" ")[1].trim()
-        } catch (e: ClassNotFoundException) {
+        } catch (_: Throwable) {
             null
         }
     }
@@ -87,22 +88,22 @@ object MinecraftVersionMatcher : VersionMatcher {
  */
 object VersionMatchers {
 
-    private val cache = java.util.concurrent.ConcurrentHashMap<String, VersionMatcher>()
-
-    fun resolve(fqcn: String): VersionMatcher {
-        if (fqcn.isBlank()) return MinecraftVersionMatcher
-        cache[fqcn]?.let { return it }
-        val v = try {
-            val cls = loadClass(fqcn)
+    /** ClassValue 随 matcher defining ClassLoader 生命周期回收，天然隔离不同插件的同名类。 */
+    private val cache = object : ClassValue<VersionMatcher>() {
+        override fun computeValue(cls: Class<*>): VersionMatcher {
+            return try {
             val obj = runCatching { cls.getField("INSTANCE").get(null) as? VersionMatcher }.getOrNull()
             obj ?: (cls.getDeclaredConstructor().apply { isAccessible = true }.newInstance() as VersionMatcher)
         } catch (t: Throwable) {
-            Forensics.warn("VersionMatcher 解析失败: $fqcn — ${t.javaClass.name}: ${t.message}; 回退 NoopVersionMatcher")
+                Forensics.warn("VersionMatcher 解析失败: ${cls.name} — ${t.javaClass.name}: ${t.message}; fail-closed")
             NoopVersionMatcher
         }
-        cache[fqcn] = v
-        return v
+        }
     }
+
+    fun resolve(type: KClass<out VersionMatcher>): VersionMatcher = cache.get(type.java)
+
+    fun resolve(type: Class<out VersionMatcher>): VersionMatcher = cache.get(type)
 
     /**
      * 多 ClassLoader 探查 —— 顺序：thread context → VersionMatchers 自身 CL → system CL。
@@ -111,6 +112,15 @@ object VersionMatchers {
      * 用户在自己插件里写 @Version(matcher = "com.foo.MyMatcher") 时，MyMatcher 在插件 CL，
      * 必须穿透 system / context CL 才能解析到。
      */
+    fun resolve(fqcn: String, definingLoader: ClassLoader): VersionMatcher {
+        if (fqcn.isBlank()) return MinecraftVersionMatcher
+        val cls = try { Class.forName(fqcn, true, definingLoader) } catch (t: Throwable) {
+            Forensics.warn("VersionMatcher 加载失败: $fqcn — ${t.message}; fail-closed")
+            return NoopVersionMatcher
+        }
+        return cache.get(cls)
+    }
+
     private fun loadClass(fqcn: String): Class<*> {
         val candidates = sequenceOf(
             Thread.currentThread().contextClassLoader,

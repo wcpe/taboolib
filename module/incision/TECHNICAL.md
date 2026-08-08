@@ -192,7 +192,7 @@ private fun resolve(): Instrumentation? {
 
 **self-attach 的固有阻碍**：
 
-- JDK 9+：默认 `jdk.attach.allowAttachSelf=false`，需显式打开
+- JDK 9+：默认禁止当前进程 attach 自身；如需启用，必须在 JVM 启动参数中设置 `-Djdk.attach.allowAttachSelf=true`。Incision 不会在运行时修改这个进程级属性，因为 HotSpot 读取的是启动快照，而 ByteBuddy 等库读取实时属性，修改会造成策略分裂并影响其他插件
 - JDK 21+：无 `-XX:+EnableDynamicAgentLoading` 时打印警告并最终禁止
 - Paper/Spigot 生产配置：常以安全硬化名义禁用 self-attach
 - 精简 JRE：可能缺 `tools.jar` 或 `jdk.attach` 模块

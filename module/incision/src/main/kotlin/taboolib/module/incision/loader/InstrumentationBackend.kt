@@ -8,6 +8,7 @@ import java.lang.instrument.ClassFileTransformer
 import java.lang.instrument.Instrumentation
 import java.security.ProtectionDomain
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Instrumentation 后端 — 主力路径。
@@ -26,7 +27,7 @@ object InstrumentationBackend : Backend {
     @Volatile
     private var resolveFailed = false
 
-    private val transformers = ConcurrentHashMap<String, MutableList<(ByteArray) -> ByteArray?>>()
+    private val transformers = ConcurrentHashMap<String, CopyOnWriteArrayList<(ByteArray) -> ByteArray?>>()
 
     override val name: String = "Instrumentation"
 
@@ -97,7 +98,7 @@ object InstrumentationBackend : Backend {
 
     override fun addTransformer(className: String, transformer: (ByteArray) -> ByteArray?): Backend.BackendToken {
         val key = className.replace('.', '/')
-        transformers.computeIfAbsent(key) { mutableListOf() }.add(transformer)
+        transformers.computeIfAbsent(key) { CopyOnWriteArrayList() }.add(transformer)
         return object : Backend.BackendToken {
             override fun remove() { transformers[key]?.remove(transformer) }
         }
@@ -106,6 +107,10 @@ object InstrumentationBackend : Backend {
     override fun retransform(className: String): Boolean {
         val i = ensure() ?: return false
         val cls = findClass(className) ?: return false
+        if (!i.isRetransformClassesSupported || !i.isModifiableClass(cls)) {
+            Forensics.warn("retransform 不受支持: $className (supported=${i.isRetransformClassesSupported}, modifiable=${i.isModifiableClass(cls)})")
+            return false
+        }
         return try { i.retransformClasses(cls); true } catch (e: Throwable) {
             Forensics.warn("retransform 失败: $className — ${e.message}"); false
         }
@@ -119,4 +124,17 @@ object InstrumentationBackend : Backend {
         val internalName = className.replace('.', '/')
         return i.allLoadedClasses.firstOrNull { it.name == className || it.name.replace('.', '/') == internalName }
     }
+
+    override fun isClassLoaded(className: String): Boolean {
+        val binaryName = className.replace('/', '.')
+        return ensure()?.allLoadedClasses?.any { it.name == binaryName } == true
+    }
+
+    /**
+     * 返回当前 Instrumentation 可见类的快照。pointcut 的 GLOB owner 只能在有界的已加载类集合中展开，
+     * 不能通过扫描 classpath 猜测尚未定义的同名类。
+     */
+    fun loadedClasses(): List<Class<*>> = ensure()?.allLoadedClasses?.toList().orEmpty()
+
+    fun clearTransformers() = transformers.clear()
 }

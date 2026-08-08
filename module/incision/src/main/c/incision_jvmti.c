@@ -61,6 +61,8 @@ static jrawMonitorID g_monitor = NULL;
 static volatile int g_extract_mode = 0;
 static jbyte *g_extract_buf = NULL;
 static jint g_extract_len = 0;
+/* 抽取请求绑定目标 jclass，避免并发或嵌套钩子复制到无关类字节码。 */
+static jclass g_extract_target = NULL;
 
 /* djb2 字符串哈希 */
 static unsigned int hash_str(const char *s) {
@@ -78,7 +80,7 @@ static int cache_find(const char *key) {
     unsigned int h = hash_str(key) % CACHE_CAPACITY;
     for (int i = 0; i < CACHE_CAPACITY; i++) {
         int idx = (int)((h + i) % CACHE_CAPACITY);
-        if (g_cache[idx].key == NULL) return -1;   /* 空槽，终止探测 */
+        if (g_cache[idx].key == NULL) continue;
         if (strcmp(g_cache[idx].key, key) == 0) return idx;
     }
     return -1;
@@ -118,10 +120,7 @@ static void cache_remove(const char *key) {
     if (g_cache[idx].bytes != NULL) { free(g_cache[idx].bytes); g_cache[idx].bytes = NULL; }
     g_cache[idx].len = 0;
     g_cache_count--;
-    /* 注：不做线性探测 rehash，因 cache_find 遇 NULL 即停；
-       被移除槽后续的同哈希链条目再次查询时会返回 -1。
-       可接受代价：同链条目在删除后变得不可达，
-       但 Incision 用法以写入和读取为主，很少删除，因此暂不实现 rehash。 */
+    /* cache_find 会扫描完整探测区间，因此删除空槽不会截断碰撞链。 */
 }
 
 /* 清空全部缓存 */
@@ -150,7 +149,8 @@ static void JNICALL classFileLoadHook(
         unsigned char **new_class_data) {
 
     /* 抽取模式：复制原始字节码到临时缓冲区，不修改类 */
-    if (g_extract_mode) {
+    if (g_extract_mode && g_extract_target != NULL && class_being_redefined != NULL &&
+            (*jni)->IsSameObject(jni, class_being_redefined, g_extract_target)) {
         g_extract_buf = (jbyte *)malloc(class_data_len);
         if (g_extract_buf != NULL) {
             memcpy(g_extract_buf, class_data, class_data_len);
@@ -266,6 +266,64 @@ static jboolean JNICALL nRetransform(JNIEnv *jni, jclass self, jclass target) {
     return err == JVMTI_ERROR_NONE ? JNI_TRUE : JNI_FALSE;
 }
 
+/*
+ * 按内部名处理所有已加载同名类。NMSProxy 可能让模板类与生成类分别存在于 PluginClassLoader
+ * 和 AsmClassLoader；Java 侧随意挑第一个 Class 会只织入模板，实际虚调用仍完全不命中。
+ */
+static jint process_loaded_by_name(JNIEnv *jni, jstring internalName, jboolean retransform) {
+    if (g_jvmti == NULL) return -1;
+    const char *name = (*jni)->GetStringUTFChars(jni, internalName, NULL);
+    if (name == NULL) return -1;
+    size_t descriptorLen = strlen(name) + 3;
+    char *descriptor = (char *)malloc(descriptorLen);
+    if (descriptor == NULL) {
+        (*jni)->ReleaseStringUTFChars(jni, internalName, name);
+        return -1;
+    }
+    descriptor[0] = 'L';
+    strcpy(descriptor + 1, name);
+    strcat(descriptor, ";");
+
+    jint classCount = 0;
+    jclass *classes = NULL;
+    jvmtiError err = (*g_jvmti)->GetLoadedClasses(g_jvmti, &classCount, &classes);
+    if (err != JVMTI_ERROR_NONE) {
+        free(descriptor);
+        (*jni)->ReleaseStringUTFChars(jni, internalName, name);
+        return -(jint)err;
+    }
+    jint matched = 0;
+    for (jint index = 0; index < classCount; index++) {
+        char *signature = NULL;
+        if ((*g_jvmti)->GetClassSignature(g_jvmti, classes[index], &signature, NULL) != JVMTI_ERROR_NONE) continue;
+        jboolean same = signature != NULL && strcmp(signature, descriptor) == 0;
+        if (signature != NULL) (*g_jvmti)->Deallocate(g_jvmti, (unsigned char *)signature);
+        if (!same) continue;
+        matched++;
+        if (retransform) {
+            jvmtiError transformErr = (*g_jvmti)->RetransformClasses(g_jvmti, 1, &classes[index]);
+            if (transformErr != JVMTI_ERROR_NONE) {
+                fprintf(stderr, "[Incision][JVMTI] RetransformClasses(%s) 失败: error=%d\n", name, (int)transformErr);
+                fflush(stderr);
+                matched = -(jint)transformErr;
+                break;
+            }
+        }
+    }
+    (*g_jvmti)->Deallocate(g_jvmti, (unsigned char *)classes);
+    free(descriptor);
+    (*jni)->ReleaseStringUTFChars(jni, internalName, name);
+    return matched;
+}
+
+static jint JNICALL nRetransformByName(JNIEnv *jni, jclass self, jstring internalName) {
+    return process_loaded_by_name(jni, internalName, JNI_TRUE);
+}
+
+static jint JNICALL nLoadedClassCount(JNIEnv *jni, jclass self, jstring internalName) {
+    return process_loaded_by_name(jni, internalName, JNI_FALSE);
+}
+
 static jboolean JNICALL nAvailable(JNIEnv *jni, jclass self) {
     return g_jvmti != NULL ? JNI_TRUE : JNI_FALSE;
 }
@@ -304,6 +362,10 @@ static void JNICALL nDispose(JNIEnv *jni, jclass self) {
         g_backend_class = NULL;
     }
     g_callback_mid = NULL;
+    if (g_extract_target != NULL) {
+        (*jni)->DeleteGlobalRef(jni, g_extract_target);
+        g_extract_target = NULL;
+    }
 
     /* 释放所有缓存字节码 */
     if (g_jvmti != NULL && g_monitor != NULL) {
@@ -374,10 +436,15 @@ static jbyteArray JNICALL native_extract_bytes(JNIEnv *env, jclass clz, jobject 
     g_extract_mode = 1;
     g_extract_buf = NULL;
     g_extract_len = 0;
+    g_extract_target = (jclass)(*env)->NewGlobalRef(env, targetClass);
 
     jvmtiError err = (*g_jvmti)->RetransformClasses(g_jvmti, 1, &targetClass);
 
     g_extract_mode = 0;
+    if (g_extract_target != NULL) {
+        (*env)->DeleteGlobalRef(env, g_extract_target);
+        g_extract_target = NULL;
+    }
 
     jbyteArray result = NULL;
     if (err == JVMTI_ERROR_NONE && g_extract_buf != NULL) {
@@ -1079,6 +1146,8 @@ static jobject JNICALL native_invoke_method(JNIEnv *env, jclass clz,
 static JNINativeMethod g_methods[] = {
     { "nInit",        "(Ljava/lang/Class;)Z",  (void *)nInit        },
     { "nRetransform", "(Ljava/lang/Class;)Z",  (void *)nRetransform },
+    { "nRetransformByName", "(Ljava/lang/String;)I", (void *)nRetransformByName },
+    { "nLoadedClassCount", "(Ljava/lang/String;)I", (void *)nLoadedClassCount },
     { "nAvailable",   "()Z",                   (void *)nAvailable   },
     { "nDispose",     "()V",                   (void *)nDispose     },
     { "nDefineClass", "(Ljava/lang/ClassLoader;Ljava/lang/String;[B)Ljava/lang/Class;", (void *)nDefineClass },

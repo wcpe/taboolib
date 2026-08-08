@@ -79,7 +79,13 @@ class DefaultIncisionGate(private val apiVersion: Int) : IncisionGateApi {
 
     override fun healByClassLoader(cl: ClassLoader): Int {
         var n = 0
-        for ((_, chain) in chains) n += chain.removeByClassLoader(cl)
+        for ((target, chain) in chains) {
+            n += chain.removeByClassLoader(cl)
+            if (chain.isEmpty()) {
+                chains.remove(target, chain)
+                implanted.remove(target)
+            }
+        }
         return n
     }
 
@@ -98,6 +104,7 @@ class DefaultIncisionGate(private val apiVersion: Int) : IncisionGateApi {
             return n
         }
         fun snapshot(): List<AdviceProxy> = entries.toList()
+        fun isEmpty(): Boolean = entries.isEmpty()
     }
 
     private data class TokenImpl(

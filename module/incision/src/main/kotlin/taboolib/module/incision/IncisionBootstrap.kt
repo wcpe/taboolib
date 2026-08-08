@@ -1,6 +1,5 @@
 package taboolib.module.incision
 
-import io.izzel.incision.bridge.IncisionBridge
 import taboolib.common.Inject
 import taboolib.common.LifeCycle
 import taboolib.common.env.RuntimeDependencies
@@ -9,7 +8,9 @@ import taboolib.common.platform.Awake
 import taboolib.module.incision.diagnostic.Checkup
 import taboolib.module.incision.diagnostic.ConflictAnalyzer
 import taboolib.module.incision.diagnostic.Forensics
+import taboolib.module.incision.dsl.Scalpel
 import taboolib.module.incision.gate.IncisionGateLocator
+import taboolib.module.incision.gate.GateBootstrapper
 import taboolib.module.incision.lifecycle.AutoHealHandler
 import taboolib.module.incision.loader.InstrumentationBackend
 import taboolib.module.incision.loader.JvmtiBackend
@@ -17,6 +18,7 @@ import taboolib.module.incision.loader.PipelineBackend
 import taboolib.module.incision.reflex.IncisionReflex
 import taboolib.module.incision.remap.RemapRouter
 import taboolib.module.incision.remap.TabooLibNmsResolver
+import taboolib.module.incision.runtime.CanonicalBridge
 import taboolib.module.incision.runtime.SurgeryRegistry
 import taboolib.module.incision.runtime.TheatreDispatcher
 
@@ -35,7 +37,11 @@ import taboolib.module.incision.runtime.TheatreDispatcher
 object IncisionBootstrap {
 
     /** 当前 incision API 版本，用于网关版本协商 */
-    const val API_VERSION = 1
+    const val API_VERSION = 2
+
+    /** 系统属性名必须运行时拼接，避免插件 Shadow 把协议键误当作 taboolib 包名重定位。 */
+    private val backendProperty =
+        String(charArrayOf('t', 'a', 'b', 'o', 'o', 'l', 'i', 'b')) + ".incision.backend"
 
     init {
         prepareConst()
@@ -48,13 +54,7 @@ object IncisionBootstrap {
         TabooLibNmsResolver.installIfAvailable()
         // 2. 安装反射穿透适配器，让 TabooLib reflex 在 invoke 时自动 withoutIncision
         IncisionReflex.installReflexAdapter()
-        // 3. 把经 gradle 重定位后真实的 TheatreDispatcher 类名注册进桥（插件 CL 版本）
-        try {
-            IncisionBridge.registerLocalDispatcher(TheatreDispatcher::class.java)
-        } catch (t: Throwable) {
-            Forensics.warn("Incision bridge registerLocalDispatcher failed: ${t.message}")
-        }
-        // 4. 注入 IncisionBridge 到 bootstrap ClassLoader，使跨 CL 目标（NMS、Bukkit API）能解析桥类
+        // 3. 注入 IncisionBridge 到 bootstrap ClassLoader，使跨 CL 目标（NMS、Bukkit API）能解析桥类
         //    必须在任何 installWeaver/retransform 之前完成
         injectBridgeIntoSystemClassLoader()
         Forensics.info("Incision CONST: api=$API_VERSION resolver=${RemapRouter.name()}")
@@ -68,6 +68,7 @@ object IncisionBootstrap {
         // 1. 接入 / 创建 IncisionGate
         try {
             val gate = IncisionGateLocator.locateOrCreate(API_VERSION)
+            CanonicalBridge.bindSystemHost(gate)
             Forensics.info("Incision Gate online: api=${gate.apiVersion()}")
         } catch (t: Throwable) {
             Forensics.warn("Incision Gate 接入失败（将使用本地 dispatcher 兜底）：${t.javaClass.name}: ${t.message}")
@@ -85,7 +86,7 @@ object IncisionBootstrap {
         } else if (JvmtiBackend.available()) {
             Forensics.info("JVMTI native 后端就绪（Instrumentation 不可用）")
         } else {
-            Forensics.warn("Instrumentation / JVMTI 均不可用 — 仅 Pipeline / ClassLoaderHook 路径可用")
+            Forensics.warn("Instrumentation / JVMTI 均不可用 — 仅 NMSProxy 生成期 Pipeline 路径可用")
         }
     }
 
@@ -95,10 +96,15 @@ object IncisionBootstrap {
         // 卸载当前 ClassLoader 下所有 advice
         AutoHealHandler.healByClassLoader(IncisionBootstrap::class.java.classLoader)
         SurgeryRegistry.list().toList().forEach { it.heal() }
+        Scalpel.shutdown()
+        TheatreDispatcher.clear()
+        SurgeryRegistry.clear()
+        PipelineBackend.clear()
+        InstrumentationBackend.clearTransformers()
         // 解绑本插件在桥上的本地 dispatcher 缓存
-        runCatching {
-            IncisionBridge.unregisterLocalDispatcher(IncisionBootstrap::class.java.classLoader)
-        }
+        CanonicalBridge.unregisterDispatcher(IncisionBootstrap::class.java.classLoader)
+        GateBootstrapper.release(IncisionBootstrap::class.java.classLoader)
+        JvmtiBackend.dispose()
     }
 
     private fun probeAsmTree() {
@@ -154,8 +160,8 @@ object IncisionBootstrap {
         } catch (_: Throwable) {
             null
         }
-        if (existing != null && existing.classLoader == null) {
-            Forensics.info("IncisionBridge 已存在于 bootstrap ClassLoader")
+        if (existing != null && (existing.classLoader == null || existing.classLoader === sysCL)) {
+            Forensics.info("IncisionBridge 已存在于 ${existing.classLoader ?: "bootstrap"} ClassLoader")
             registerDispatcherOn(existing)
             return
         }
@@ -165,8 +171,10 @@ object IncisionBootstrap {
             Forensics.warn("IncisionBridge.class 资源未找到: $resourcePath")
             return
         }
+        // 显式选择 Instrumentation 时不得探测 native；System.load 的进程级副作用无法在插件 CL 间回滚。
+        val forcedBackend = System.getProperty(backendProperty, "auto").lowercase()
         // 路径 1: JVMTI native — defineClass 直接注入 bootstrap CL
-        if (JvmtiBackend.available()) {
+        if (forcedBackend != "instrumentation" && JvmtiBackend.available()) {
             val cls = JvmtiBackend.defineClassInClassLoader(null, bridgeClassName, bytes)
             if (cls != null) {
                 Forensics.info("IncisionBridge 已注入 bootstrap ClassLoader (JVMTI)")
@@ -197,13 +205,17 @@ object IncisionBootstrap {
             }
         }
         // 路径 3: fallback — 仅在插件 CL 中，跨 CL 目标无法使用
+        runCatching {
+            Class.forName(bridgeClassName, true, IncisionBootstrap::class.java.classLoader)
+        }.getOrNull()?.let(::registerDispatcherOn)
         Forensics.warn("IncisionBridge 未能注入 bootstrap/system CL — 跨 ClassLoader 目标（NMS、Bukkit API）将不可用")
     }
 
     private fun registerDispatcherOn(bridgeClass: Class<*>) {
         try {
-            val regMethod = bridgeClass.getMethod("registerLocalDispatcher", Class::class.java)
-            regMethod.invoke(null, TheatreDispatcher::class.java)
+            // 后续 target 注册、host 绑定与卸载必须复用同一个类句柄，不能再直接链接插件内同名 Bridge。
+            CanonicalBridge.bind(bridgeClass)
+            CanonicalBridge.registerDispatcher(TheatreDispatcher::class.java)
             Forensics.info("IncisionBridge dispatcher 已注册 (CL=${bridgeClass.classLoader ?: "bootstrap"})")
         } catch (t: Throwable) {
             Forensics.warn("IncisionBridge registerLocalDispatcher 失败: ${t.message}")

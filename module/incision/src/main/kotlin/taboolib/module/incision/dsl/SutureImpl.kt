@@ -9,7 +9,7 @@ import taboolib.module.incision.runtime.TheatreDispatcher
 import kotlin.reflect.KClass
 
 /**
- * Suture 默认实现 — 持有一组 advice 条目；heal 时从 dispatcher 移除。
+ * Suture 默认实现 — 持有一组 advice 条目；heal 必须先恢复物理织入，再移除 dispatcher。
  */
 internal class SutureImpl(
     override val id: String,
@@ -23,13 +23,10 @@ internal class SutureImpl(
 
     override fun heal(): Boolean {
         if (state == Suture.State.HEALED) return false
+        // 先重算字节码再移除 handler；若物理回滚失败，保留当前 suture，避免留下必然 dispatch 失败的半卸载状态。
+        if (!Scalpel.removeWeaver(entries)) return false
         for (e in entries) {
             TheatreDispatcher.unregister(e.target, e.id)
-            // 清理自动扩展的 $Companion 条目
-            if (!e.target.owner.endsWith("\$Companion")) {
-                val companionTarget = e.target.copy(owner = e.target.owner + "\$Companion")
-                TheatreDispatcher.unregister(companionTarget, e.id + "#companion")
-            }
         }
         SurgeryRegistry.unregister(id)
         state = Suture.State.HEALED

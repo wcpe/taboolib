@@ -2,6 +2,7 @@ package taboolib.module.incision.loader
 
 import taboolib.module.incision.diagnostic.Forensics
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Pipeline 后端 — 供 TabooLib `RemapTranslation` / `AsmClassTranslation` 在
@@ -20,18 +21,26 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object PipelineBackend : Backend {
 
-    private val transformers = ConcurrentHashMap<String, MutableList<(ByteArray) -> ByteArray?>>()
+    private val transformers = ConcurrentHashMap<String, CopyOnWriteArrayList<(ByteArray) -> ByteArray?>>()
 
     override val name: String = "Pipeline"
     override fun available(): Boolean = true
 
     override fun addTransformer(className: String, transformer: (ByteArray) -> ByteArray?): Backend.BackendToken {
         val key = className.replace('.', '/')
-        transformers.computeIfAbsent(key) { mutableListOf() }.add(transformer)
+        val list = transformers.computeIfAbsent(key) { CopyOnWriteArrayList() }
+        list.add(transformer)
         return object : Backend.BackendToken {
-            override fun remove() { transformers[key]?.remove(transformer) }
+            override fun remove() {
+                list.remove(transformer)
+                // 空列表必须连同索引删除，否则 has() 会把已撤销的安装继续报告为活跃。
+                if (list.isEmpty()) transformers.remove(key, list)
+            }
         }
     }
+
+    /** Pipeline 只处理此后由 NMSProxy 生成的字节码，不具备已加载类查询或重转换能力。 */
+    override fun isClassLoaded(className: String): Boolean = false
 
     /** 供 TabooLib 管线末端调用 — 给定 className + 当前字节码，返回织入后的字节码。 */
     fun apply(className: String, bytes: ByteArray): ByteArray {

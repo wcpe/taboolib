@@ -2,6 +2,7 @@ package taboolib.module.incision.weaver.site.matcher
 
 import taboolib.module.incision.api.Anchor
 import taboolib.module.incision.weaver.site.SiteSpec
+import taboolib.module.incision.weaver.site.matchesPattern
 import taboolib.module.incision.weaver.site.pattern.SitePattern
 
 /**
@@ -26,9 +27,9 @@ class InvokeMatcher(sites: List<SiteSpec>) : SiteMatcher {
         if (relevant.isEmpty()) return emptyList()
         var out: MutableList<MatchEvent>? = null
         for ((i, site) in relevant.withIndex()) {
-            val ownerOk = site.ownerPattern.isEmpty() || site.ownerPattern == owner
-            val nameOk = site.namePattern.isEmpty() || site.namePattern == name
-            val descOk = site.descPattern.isEmpty() || site.descPattern == descriptor
+            val ownerOk = site.matchesPattern(site.ownerPattern, owner)
+            val nameOk = site.matchesPattern(site.namePattern, name)
+            val descOk = site.matchesPattern(site.descPattern, descriptor)
             if (!ownerOk || !nameOk || !descOk) continue
             val idx = counters[i]
             counters[i] = idx + 1

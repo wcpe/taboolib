@@ -1,5 +1,9 @@
 package taboolib.module.incision.annotation
 
+import taboolib.module.incision.api.MinecraftVersionMatcher
+import taboolib.module.incision.api.VersionMatcher
+import kotlin.reflect.KClass
+
 /**
  * 版本范围过滤注解。
  *
@@ -34,5 +38,5 @@ annotation class Version(
     /** 结束版本（含）；空字符串表示无上界。 */
     val end: String = "",
     /** 版本来源匹配器实现类的 FQCN；留空时使用默认的 Minecraft matcher。 */
-    val matcher: String = "",
+    val matcher: KClass<out VersionMatcher> = MinecraftVersionMatcher::class,
 )

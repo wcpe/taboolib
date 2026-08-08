@@ -5,8 +5,8 @@ import org.objectweb.asm.Label
 import org.objectweb.asm.MethodVisitor
 import org.objectweb.asm.Opcodes
 import taboolib.module.incision.diagnostic.Trauma
-import taboolib.module.incision.loader.JvmtiBackend
-import java.lang.reflect.Method
+import java.lang.ref.WeakReference
+import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -448,49 +448,44 @@ object PredCompiler {
         }
     }
 
-    // ---------- 类装载器：反射优先；JDK 9+ 模块边界失败则退到 JNI DefineClass ----------
+    // ---------- 类装载器 -------------------------------------------------------
 
     private object LoaderHelper {
-        private val defineMethod: Method? by lazy {
-            try {
-                val m = ClassLoader::class.java.getDeclaredMethod(
-                    "defineClass",
-                    String::class.java,
-                    ByteArray::class.java,
-                    Int::class.javaPrimitiveType,
-                    Int::class.javaPrimitiveType,
-                )
-                m.isAccessible = true
-                m
-            } catch (_: Throwable) {
-                null
-            }
-        }
+
+        /**
+         * 每个 advice defining loader 对应一个弱引用生成类加载器。
+         *
+         * 生成谓词只需要通过 parent 看见插件中的 Predicate/PredOps，并不需要强行定义进插件
+         * ClassLoader。使用子加载器可以同时避开 JDK 9+ 对 ClassLoader#defineClass 的模块封装，
+         * 也避免为普通类定义误触 JVMTI native；弱键确保插件卸载后不会被全局缓存阻止回收。
+         */
+        private val generatedLoaders = WeakHashMap<ClassLoader, WeakReference<GeneratedPredicateClassLoader>>()
 
         fun define(cl: ClassLoader, name: String, bytes: ByteArray): Class<*> {
             val binaryName = name.replace('/', '.')
-            try {
-                return Class.forName(binaryName, false, cl)
-            } catch (_: Throwable) {
-            }
-            val reflectError: Throwable? = defineMethod?.let { m ->
-                try {
-                    return m.invoke(cl, binaryName, bytes, 0, bytes.size) as Class<*>
-                } catch (t: Throwable) {
-                    t
+            val generatedLoader = synchronized(generatedLoaders) {
+                generatedLoaders[cl]?.get() ?: GeneratedPredicateClassLoader(cl).also {
+                    // value 也必须是弱引用；GeneratedPredicateClassLoader.parent 会反向强持有 key，
+                    // 若直接把 loader 作为 value，WeakHashMap 的弱键将永远无法回收。
+                    generatedLoaders[cl] = WeakReference(it)
                 }
             }
-            // JDK 9+ 或反射被禁：退到 native JNI DefineClass（不受模块系统限制）
-            try {
-                val cls = JvmtiBackend.defineClassInClassLoader(cl, name, bytes)
-                if (cls != null) return cls
-            } catch (_: Throwable) {
-                // native 不可用时继续抛原反射异常
+            return try {
+                generatedLoader.define(binaryName, bytes)
+            } catch (t: Throwable) {
+                throw Trauma.Predicate.RuntimeFailure("<gen $name>", null, t)
             }
-            throw Trauma.Predicate.RuntimeFailure(
-                "<gen $name>", null,
-                reflectError ?: IllegalStateException("defineClass unavailable (reflection + JVMTI both failed)")
-            )
+        }
+
+        /**
+         * defineClass 只能由 ClassLoader 子类合法调用；同步保证同一生成名称不会被并发重复定义。
+         * 类名由全局递增序列生成，findLoadedClass 仍作为防御性检查保留。
+         */
+        private class GeneratedPredicateClassLoader(parent: ClassLoader) : ClassLoader(parent) {
+
+            @Synchronized
+            fun define(binaryName: String, bytes: ByteArray): Class<*> =
+                findLoadedClass(binaryName) ?: defineClass(binaryName, bytes, 0, bytes.size)
         }
     }
 }

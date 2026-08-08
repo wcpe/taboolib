@@ -20,6 +20,29 @@ interface NameResolver {
     /** 返回 (规范化名, 规范化描述符) */
     fun resolveField(owner: String, name: String, desc: String): Pair<String, String>
 
+    /**
+     * 映射 JVM descriptor 内嵌的所有对象类型。
+     *
+     * descriptor 是坐标的一部分，若只映射 owner，参数或返回值含 NMS 类型的方法仍会静默失配。
+     */
+    fun resolveDescriptor(descriptor: String): String {
+        val out = StringBuilder(descriptor.length)
+        var index = 0
+        while (index < descriptor.length) {
+            val current = descriptor[index]
+            if (current != 'L') {
+                out.append(current)
+                index++
+                continue
+            }
+            val end = descriptor.indexOf(';', index)
+            if (end < 0) return descriptor
+            out.append('L').append(resolveOwner(descriptor.substring(index + 1, end))).append(';')
+            index = end + 1
+        }
+        return out.toString()
+    }
+
     /** 是否需要重映射（Noop 对非 NMS 返回 false） */
     fun isRemappableTarget(owner: String): Boolean
 

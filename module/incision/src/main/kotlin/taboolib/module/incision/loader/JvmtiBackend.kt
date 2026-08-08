@@ -3,6 +3,7 @@ package taboolib.module.incision.loader
 import taboolib.module.incision.diagnostic.Forensics
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * JVMTI native backend — retransforms already-loaded classes without
@@ -19,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object JvmtiBackend : Backend {
 
-    private val transformers = ConcurrentHashMap<String, MutableList<(ByteArray) -> ByteArray?>>()
+    private val transformers = ConcurrentHashMap<String, CopyOnWriteArrayList<(ByteArray) -> ByteArray?>>()
 
     /** 防重入保护：weave 过程中触发的类加载不应再次进入 transformer */
     private val reentrantGuard = ThreadLocal.withInitial { false }
@@ -36,7 +37,7 @@ object JvmtiBackend : Backend {
 
     override fun addTransformer(className: String, transformer: (ByteArray) -> ByteArray?): Backend.BackendToken {
         val key = className.replace('.', '/')
-        transformers.computeIfAbsent(key) { mutableListOf() }.add(transformer)
+        transformers.computeIfAbsent(key) { CopyOnWriteArrayList() }.add(transformer)
         return object : Backend.BackendToken {
             override fun remove() { transformers[key]?.remove(transformer) }
         }
@@ -44,14 +45,16 @@ object JvmtiBackend : Backend {
 
     override fun retransform(className: String): Boolean {
         if (!available()) return false
-        val cls = findLoadedClass(className)
-        if (cls == null) {
+        val internalName = className.replace('.', '/')
+        val loadedCount = runCatching { nLoadedClassCount(internalName) }.getOrDefault(0)
+        if (loadedCount <= 0) {
             Forensics.debug("JvmtiBackend.retransform: $className not loaded yet, will transform on load")
-            return true
+            return false
         }
         return try {
-            val ok = nRetransform(cls)
-            Forensics.debug("JvmtiBackend.retransform $className → $ok (loader=${cls.classLoader})")
+            val transformed = nRetransformByName(internalName)
+            val ok = transformed == loadedCount
+            Forensics.debug("JvmtiBackend.retransform $className → $ok (loaded=$loadedCount transformed=$transformed)")
             ok
         } catch (t: Throwable) {
             Forensics.warn("JvmtiBackend.retransform failed: $className — ${t.message}")
@@ -68,6 +71,8 @@ object JvmtiBackend : Backend {
         if (list == null) return null
         Forensics.debug("JvmtiBackend.onClassFileLoad: $name (${list.size} transformers, ${bytes.size} bytes)")
         reentrantGuard.set(true)
+        val prevLoader = taboolib.module.incision.weaver.Scalpel.currentTransformLoader.get()
+        taboolib.module.incision.weaver.Scalpel.currentTransformLoader.set(loader)
         try {
             var cur = bytes
             var changed = false
@@ -80,6 +85,7 @@ object JvmtiBackend : Backend {
             Forensics.debug("JvmtiBackend.onClassFileLoad: $name → changed=$changed (${cur.size} bytes)")
             return if (changed) cur else null
         } finally {
+            taboolib.module.incision.weaver.Scalpel.currentTransformLoader.set(prevLoader)
             reentrantGuard.set(false)
         }
     }
@@ -90,6 +96,8 @@ object JvmtiBackend : Backend {
 
     @JvmStatic private external fun nInit(backendClass: Class<*>): Boolean
     @JvmStatic private external fun nRetransform(target: Class<*>): Boolean
+    @JvmStatic private external fun nRetransformByName(internalName: String): Int
+    @JvmStatic private external fun nLoadedClassCount(internalName: String): Int
     @JvmStatic private external fun nAvailable(): Boolean
     @JvmStatic external fun nDispose()
     @JvmStatic external fun nDefineClass(loader: ClassLoader?, name: String, bytes: ByteArray): Class<*>?
@@ -118,10 +126,22 @@ object JvmtiBackend : Backend {
         }
     }
 
+    override fun isClassLoaded(className: String): Boolean =
+        available() && runCatching { nLoadedClassCount(className.replace('.', '/')) > 0 }.getOrDefault(false)
+
+    /** 当前插件 lease 释放时停止 native 回调并清空所有插件类引用，避免 reload 持有已关闭 loader。 */
+    @Synchronized
+    fun dispose() {
+        transformers.clear()
+        if (!available) return
+        runCatching { nDispose() }.onFailure { Forensics.warn("JvmtiBackend.dispose 失败: ${it.message}") }
+        available = false
+    }
+
     fun cacheOriginal(owner: String, bytes: ByteArray): Boolean {
         if (!available()) return false
         return try {
-            nCacheOriginal(owner, bytes)
+            nCacheOriginal(cacheKey(owner), bytes)
         } catch (t: Throwable) {
             Forensics.warn("nCacheOriginal 失败: ${t.message}")
             false
@@ -131,7 +151,7 @@ object JvmtiBackend : Backend {
     fun getCachedOriginal(owner: String): ByteArray? {
         if (!available()) return null
         return try {
-            nGetCachedOriginal(owner)
+            nGetCachedOriginal(cacheKey(owner))
         } catch (t: Throwable) {
             Forensics.warn("nGetCachedOriginal 失败: ${t.message}")
             null
@@ -151,10 +171,16 @@ object JvmtiBackend : Backend {
     fun purgeCache(owner: String) {
         if (!available()) return
         try {
-            nPurgeCache(owner)
+            nPurgeCache(cacheKey(owner))
         } catch (t: Throwable) {
             Forensics.warn("nPurgeCache 失败: ${t.message}")
         }
+    }
+
+    /** native 原始字节缓存按 defining loader 身份隔离同名类。 */
+    private fun cacheKey(owner: String): String {
+        val loader = taboolib.module.incision.weaver.Scalpel.currentTransformLoader.get()
+        return "${loader?.let { System.identityHashCode(it) } ?: 0}:$owner"
     }
 
     // ----------------------------------------------------------------
@@ -282,10 +308,13 @@ object JvmtiBackend : Backend {
     }
 
     private fun findLoadedClass(className: String): Class<*>? {
-        val m = findLoadedClassMethod ?: return findClass(className)
+        // Backend API 同时接受 internal name 与 binary name；ClassLoader.findLoadedClass 只接受点号形式。
+        // 不在这里规范化会把已加载插件类误判成 PENDING_LOAD，之后也不会再收到首次加载回调。
+        val binaryName = className.replace('/', '.')
+        val m = findLoadedClassMethod ?: return findClass(binaryName)
         for (cl in classLoaders()) {
             try {
-                val cls = m.invoke(cl, className) as? Class<*>
+                val cls = m.invoke(cl, binaryName) as? Class<*>
                 if (cls != null) return cls
             } catch (_: Throwable) {}
         }

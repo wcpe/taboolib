@@ -22,15 +22,22 @@ package taboolib.module.incision.annotation
 @MustBeDocumented
 annotation class Bypass(
 
-    /** 宿主方法描述符，格式为 `类#方法名(参数)返回`。 */
-    val method: String,
+    /** 兼容的宿主 Scope；非空时优先于 [method] 和 [pointcut]。 */
+    val scope: String = "",
 
     /** 被替换的目标指令锚点。 */
     val site: Site,
+
+    /** v2 结构化宿主选择器。 */
+    val pointcut: Pointcut = Pointcut(),
+
+    /** 旧版宿主描述符别名；只在 [scope] 为空时优先于 [pointcut]。 */
+    @Deprecated("请使用 scope 或 pointcut")
+    val method: String = "",
 
     /** 额外的指令序列约束，用于在同一宿主方法中进一步缩小命中范围。 */
     val pattern: InsnPattern = InsnPattern([]),
 
     /** 命名标签，可供 DSL、诊断输出或后续匹配事件引用。 */
-    val where: String = "",
+    val predicate: String = "",
 )

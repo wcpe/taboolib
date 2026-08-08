@@ -1,10 +1,13 @@
-package taboolib.module.incision.weaver
+﻿package taboolib.module.incision.weaver
 
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.ClassWriter
 import org.objectweb.asm.MethodVisitor
 import org.objectweb.asm.Opcodes
 import org.objectweb.asm.commons.AdviceAdapter
+import org.objectweb.asm.tree.ClassNode
+import org.objectweb.asm.tree.LdcInsnNode
+import org.objectweb.asm.tree.MethodInsnNode
 import taboolib.module.incision.api.Anchor
 import taboolib.module.incision.api.MethodCoordinate
 import taboolib.module.incision.cache.IncisionCache
@@ -20,18 +23,21 @@ import java.io.File
 /**
  * 主 weaver — 接收一个目标类的字节码，针对若干 target 方法注入 dispatcher 调用。
  *
- * 注入的 JVM 调用签名（固定由 IncisionGate / TheatreDispatcher 持有）：
+ * 注入的 JVM 调用签名（固定由 bootstrap/system ClassLoader 中的 IncisionBridge 持有）：
  * ```
- * INVOKESTATIC taboolib/module/incision/runtime/TheatreDispatcher.dispatch
- *   (Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
+ * INVOKESTATIC io/izzel/incision/bridge/IncisionBridge.dispatch
+ *   (Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
  * ```
- * 后续 GateBootstrapper 启用后会把调用重定向到 `taboolib/incision/gate/IncisionGate`。
  *
- * 当前支持 Lead / Trail / Splice / Excise；Graft / Bypass / Trim 标记为待实现。
+ * 同一目标可能被多个插件声明。后注册 transformer 会收到前一个 transformer 的输出，
+ * 因此入口 advice 必须识别已有 Bridge 调用，保证 JVM 中只有一个物理入口，再由 Bridge
+ * 按注册顺序广播给所有声明该目标的 dispatcher。
  */
 class Scalpel(
     private val resolver: NameResolver = RemapRouter,
     private val targetsByOwner: Map<String, List<AdviceTargetSpec>>,
+    /** 仅 JVMTI backend 需要 native 原始字节缓存；Instrumentation 自己提供重转换基线。 */
+    private val useJvmtiBaseline: Boolean = false,
 ) {
 
     data class AdviceTargetSpec(
@@ -50,26 +56,34 @@ class Scalpel(
         return try {
             val probeReader = ClassReader(originalBytes)
             val probeOwner = probeReader.className
-            val sourceBytes = JvmtiBackend.getCachedOriginal(probeOwner) ?: run {
-                JvmtiBackend.cacheOriginal(probeOwner, originalBytes)
-                originalBytes
-            }
-            val reader = ClassReader(sourceBytes)
-            val owner = reader.className
+            val sourceBytes = if (useJvmtiBaseline) {
+                JvmtiBackend.getCachedOriginal(probeOwner) ?: run {
+                    JvmtiBackend.cacheOriginal(probeOwner, originalBytes)
+                    originalBytes
+                }
+            } else originalBytes
+            val sourceReader = ClassReader(sourceBytes)
+            val owner = sourceReader.className
             val targets = targetsByOwner[owner] ?: return originalBytes
-            val methodSignatures = collectMethodSignatures(reader)
+            val methodSignatures = collectMethodSignatures(sourceReader)
             val resolvedTargets = targets.map { resolveAdviceTarget(owner, it, methodSignatures) }
             val loader = currentTransformLoader.get()
-            val writer = SafeClassWriter(reader, loader)
-            val visitor = WeavingClassVisitor(Opcodes.ASM9, writer, resolvedTargets)
-            reader.accept(visitor, ClassReader.EXPAND_FRAMES)
-            var bytes = writer.toByteArray()
-            // 二次 pass — 走 SiteWeaver 处理 GRAFT / BYPASS / TRIM 站点
-            val anySites = resolvedTargets.any { it.sites.isNotEmpty() }
-            if (anySites) {
-                bytes = applySiteWeaver(bytes, resolvedTargets, loader)
+            // Site 必须先落到逻辑原方法体，再由 SPLICE/EXCISE 提取 body。若先生成入口 dispatcher，
+            // proceed() 会调用尚未包含 Site 的旧 body，使 INVOKE/FIELD/NEW advice 永远不可达。
+            val bodySourceBytes = if (resolvedTargets.any { it.sites.isNotEmpty() }) {
+                applySiteWeaver(sourceBytes, resolvedTargets, loader)
+            } else {
+                sourceBytes
             }
-            generateAndRegisterBodies(owner, sourceBytes, resolvedTargets)
+            val reader = ClassReader(bodySourceBytes)
+            val writer = SafeClassWriter(reader, loader)
+            val existingEntryPhases = detectExistingEntryPhases(bodySourceBytes, resolvedTargets)
+            val visitor = WeavingClassVisitor(Opcodes.ASM9, writer, resolvedTargets, existingEntryPhases)
+            // 只映射声明坐标，绝不能再次映射服务端已经转换过的整份字节码；后者会破坏
+            // Paper/CraftBukkit 自带的 relocated 依赖名称，并在 retransform 后污染运行中的类。
+            reader.accept(visitor, ClassReader.EXPAND_FRAMES)
+            val bytes = writer.toByteArray()
+            generateAndRegisterBodies(owner, bodySourceBytes, resolvedTargets)
             devDumpIfEnabled(owner, sourceBytes, bytes)
             bytes
         } catch (t: Throwable) {
@@ -81,6 +95,9 @@ class Scalpel(
     }
 
     companion object {
+        private const val BRIDGE_OWNER = "io/izzel/incision/bridge/IncisionBridge"
+        private const val MAX_DISPATCH_PREFIX_INSNS = 64
+
         /**
          * 由 [InstrumentationBackend] 在 transform 回调中设置，携带目标类的 ClassLoader。
          * [SafeClassWriter.getClassLoader] 读取此值，让 getCommonSuperClass 的 Class.forName
@@ -360,17 +377,12 @@ class Scalpel(
             (it.matchTarget.name to it.matchTarget.descriptor) to (it.original.target.name + BodiesClassGenerator.BODY_METHOD_SUFFIX)
         }
         val bodiesName = BridgeClassLoader.bodiesClassName(owner)
-        if (BridgeClassLoader.INSTANCE.hasBodies(bodiesName)) return
-        val sourceBytes = try {
-            JvmtiBackend.getCachedOriginal(owner)
-        } catch (_: Throwable) { null } ?: run {
-            try {
-                JvmtiBackend.cacheOriginal(owner, originalBytes)
-            } catch (t: Throwable) {
-                Forensics.error("JvmtiBackend.cacheOriginal failed: $owner — ${t.message}", t)
-            }
-            originalBytes
-        }
+        val targetLoader = currentTransformLoader.get()
+        if (targetLoader != null && isClassDefined(bodiesName, targetLoader)) return
+        if (targetLoader == null && BridgeClassLoader.INSTANCE.hasBodies(bodiesName)) return
+        // 调用方已经从 JVM 基线重建完整 active plan；这里必须保留其 Site 结果，不能再从
+        // original cache 取回未织入版本，否则 Splice.proceed() 会跳过同一方法上的 Site。
+        val sourceBytes = originalBytes
         val bodiesBytes = try {
             BodiesClassGenerator.generate(sourceBytes, owner, spliceMethods, bodyMethodNames)
         } catch (t: Throwable) {
@@ -378,10 +390,21 @@ class Scalpel(
             null
         }
         if (bodiesBytes == null) return
+        // 开发 dump 同时保留 side-car 产物；跨 ClassLoader 的 proceed/Site 问题否则无法从
+        // 主类 after.class 判断实际执行的方法体。
+        devDumpIfEnabled(bodiesName, sourceBytes, bodiesBytes)
         try {
+            if (targetLoader != null && defineBodiesInTargetLoader(bodiesName, bodiesBytes, targetLoader)) {
+                Forensics.debug("Bodies class defined in target loader: $bodiesName loader=${targetLoader.javaClass.name}")
+                return
+            }
+            if (BridgeClassLoader.INSTANCE.hasBodies(bodiesName)) return
             BridgeClassLoader.INSTANCE.defineBodies(bodiesName, bodiesBytes)
             // 注册能解析目标类的 ClassLoader 为 delegate
             // contextClassLoader 不一定是插件 CL，所以多注册几个来源
+            targetLoader?.let {
+                BridgeClassLoader.INSTANCE.registerDelegate(it)
+            }
             Thread.currentThread().contextClassLoader?.let {
                 BridgeClassLoader.INSTANCE.registerDelegate(it)
             }
@@ -394,15 +417,121 @@ class Scalpel(
         }
     }
 
+    private fun defineBodiesInTargetLoader(binaryName: String, bytes: ByteArray, targetLoader: ClassLoader): Boolean {
+        if (isClassDefined(binaryName, targetLoader)) return true
+        val defined = JvmtiBackend.defineClassInClassLoader(targetLoader, binaryName, bytes) ?: return false
+        return defined.name == binaryName
+    }
+
+    private fun isClassDefined(binaryName: String, loader: ClassLoader): Boolean {
+        return try {
+            Class.forName(binaryName, false, loader)
+            true
+        } catch (_: ClassNotFoundException) {
+            false
+        } catch (_: LinkageError) {
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     private fun matchesDesc(pattern: String, actual: String): Boolean {
         if (pattern == actual) return true
         if (pattern == "(*)" || pattern == "(*)V" || pattern == "()*") return true
         return false
     }
 
+    /** 方法键必须包含 descriptor，同名重载之间不能共享"已织入"判断。 */
+    private data class MethodKey(val name: String, val descriptor: String)
+
+    /**
+     * whole-method advice 的三个物理入口阶段。
+     * SPLICE 同时承载 SPLICE/EXCISE 以及无 Site 的 GRAFT/BYPASS/TRIM，它们必须共用一个入口。
+     */
+    private enum class EntryPhase { LEAD, TRAIL, SPLICE }
+
+    /**
+     * 扫描前序 transformer 已写入的入口。
+     *
+     * Instrumentation 会把多个可重转换 transformer 串联执行，后一个插件拿到的 bytes 已包含
+     * 前一个插件的输出。若再次发射相同 phase，单次方法调用会产生 N 个 Bridge 入口，而每个入口
+     * 又广播给 N 个插件，最终放大为 N² 次。这里按"重载方法 + 完整目标签名 + phase"识别，
+     * 不会把同一方法里的其他 Site 调度或其他目标误判为重复入口。
+     */
+    private fun detectExistingEntryPhases(
+        bytes: ByteArray,
+        targets: List<ResolvedAdviceTargetSpec>,
+    ): Map<MethodKey, Set<EntryPhase>> {
+        val node = ClassNode(Opcodes.ASM9)
+        ClassReader(bytes).accept(node, ClassReader.SKIP_DEBUG)
+        val result = mutableMapOf<MethodKey, MutableSet<EntryPhase>>()
+        for (method in node.methods) {
+            // matchTarget 是运行期名+描述符，用于匹配字节码中的方法；
+            // original.target.signature 是用户声明签名，用于和 emittedSignature 匹配（dispatch key 用原始签名）
+            val signatures = targets.asSequence()
+                .filter { it.matchTarget.name == method.name && matchesEntryDescriptor(it.matchTarget.descriptor, method.desc) }
+                .map { it.original.target.signature }
+                .toSet()
+            if (signatures.isEmpty()) continue
+            for (instruction in method.instructions) {
+                if (instruction !is MethodInsnNode ||
+                    instruction.opcode != Opcodes.INVOKESTATIC ||
+                    instruction.owner != BRIDGE_OWNER ||
+                    (instruction.name != "dispatch" && instruction.name != "dispatchBypass")
+                ) continue
+                val emittedSignature = findEmittedSignature(instruction) ?: continue
+                val phase = signatures.firstNotNullOfOrNull { entryPhaseOf(it, emittedSignature) } ?: continue
+                result.computeIfAbsent(MethodKey(method.name, method.desc)) { mutableSetOf() }.add(phase)
+            }
+        }
+        return result
+    }
+
+    /** 只回看当前 Bridge 调度块；遇到上一个 Bridge 调用即停止，避免跨块取到旧签名。 */
+    private fun findEmittedSignature(call: MethodInsnNode): String? {
+        var cursor = call.previous
+        var scannedRealInstructions = 0
+        while (cursor != null && scannedRealInstructions < MAX_DISPATCH_PREFIX_INSNS) {
+            if (cursor.opcode >= 0) scannedRealInstructions++
+            if (cursor is MethodInsnNode && cursor.owner == BRIDGE_OWNER) return null
+            if (cursor is LdcInsnNode && cursor.cst is String) return cursor.cst as String
+            cursor = cursor.previous
+        }
+        return null
+    }
+
+    private fun entryPhaseOf(targetSignature: String, emittedSignature: String): EntryPhase? = when (emittedSignature) {
+        "$targetSignature@LEAD" -> EntryPhase.LEAD
+        "$targetSignature@TRAIL", "$targetSignature@TRAIL_THROW" -> EntryPhase.TRAIL
+        "$targetSignature@SPLICE" -> EntryPhase.SPLICE
+        else -> null
+    }
+
+    private fun matchesEntryDescriptor(pattern: String, actual: String): Boolean {
+        if (pattern == actual || pattern == "(*)" || pattern == "(*)V" || pattern == "()*") return true
+        val patternClose = pattern.indexOf(')')
+        val actualClose = actual.indexOf(')')
+        if (!pattern.startsWith('(') || patternClose < 0 || !actual.startsWith('(') || actualClose < 0) return false
+        val argsMatch = pattern.substring(1, patternClose) == "*" ||
+            pattern.substring(1, patternClose) == actual.substring(1, actualClose)
+        val returnMatch = pattern.substring(patternClose + 1) == "*" ||
+            pattern.substring(patternClose + 1) == actual.substring(actualClose + 1)
+        return argsMatch && returnMatch
+    }
+
+    private class RemapperBridge(val r: NameResolver) : org.objectweb.asm.commons.Remapper() {
+        override fun map(internalName: String): String = r.resolveOwner(internalName)
+        override fun mapMethodName(owner: String, name: String, descriptor: String): String =
+            r.resolveMethod(owner, name, descriptor).first
+        override fun mapFieldName(owner: String, name: String, descriptor: String): String =
+            r.resolveField(owner, name, descriptor).first
+    }
+
     private class WeavingClassVisitor(
         api: Int, cv: ClassWriter,
         val targets: List<ResolvedAdviceTargetSpec>,
+        val existingEntryPhases: Map<MethodKey, Set<EntryPhase>>,
     ) : org.objectweb.asm.ClassVisitor(api, cv) {
 
         private lateinit var className: String
@@ -421,7 +550,16 @@ class Scalpel(
             for (s in matching) mergedKinds.addAll(s.original.kinds)
             val mergedSpec = AdviceTargetSpec(matching.first().original.target, mergedKinds, matching.flatMap { it.original.sites })
             Forensics.debug("weave inject $className.$name$descriptor kinds=$mergedKinds static=${(access and Opcodes.ACC_STATIC) != 0}")
-            return AdviceInjector(api, base, access, name, descriptor, className, mergedSpec)
+            return AdviceInjector(
+                api,
+                base,
+                access,
+                name,
+                descriptor,
+                className,
+                mergedSpec,
+                existingEntryPhases[MethodKey(name, descriptor)].orEmpty(),
+            )
         }
 
         private fun matchesDescriptor(pattern: String, actual: String): Boolean {
@@ -456,6 +594,7 @@ class Scalpel(
         val methodName: String, val methodDesc: String,
         val ownerName: String,
         val spec: AdviceTargetSpec,
+        val existingEntryPhases: Set<EntryPhase>,
     ) : AdviceAdapter(api, mv, access, methodName, methodDesc) {
 
         // 使用用户声明的 target.signature 作为 dispatch key，
@@ -466,7 +605,7 @@ class Scalpel(
         private val entryKinds = spec.kinds - kindsWithSite
 
         override fun onMethodEnter() {
-            if (AdviceKind.LEAD in entryKinds) {
+            if (AdviceKind.LEAD in entryKinds && EntryPhase.LEAD !in existingEntryPhases) {
                 emitDispatcherCall("@LEAD")
                 pop()
             }
@@ -479,14 +618,14 @@ class Scalpel(
                 it == AdviceKind.SPLICE || it == AdviceKind.EXCISE
                     || it == AdviceKind.BYPASS || it == AdviceKind.GRAFT || it == AdviceKind.TRIM
             }
-            if (hasSplicePhase) {
+            if (hasSplicePhase && EntryPhase.SPLICE !in existingEntryPhases) {
                 emitDispatcherCall("@SPLICE")
                 emitReturnIfNonNull()
             }
         }
 
         override fun onMethodExit(opcode: Int) {
-            if (AdviceKind.TRAIL !in entryKinds) return
+            if (AdviceKind.TRAIL !in entryKinds || EntryPhase.TRAIL in existingEntryPhases) return
             if (opcode == ATHROW) {
                 emitThrowTrailCall()
             } else {
@@ -504,6 +643,7 @@ class Scalpel(
         private fun emitThrowTrailCall() {
             val thrLocal = newLocal(org.objectweb.asm.Type.getType("Ljava/lang/Throwable;"))
             visitVarInsn(Opcodes.ASTORE, thrLocal)
+            visitLdcInsn(org.objectweb.asm.Type.getObjectType(ownerName))
             visitLdcInsn("$targetSig@TRAIL_THROW")
             if ((methodAccess and Opcodes.ACC_STATIC) != 0) {
                 visitInsn(Opcodes.ACONST_NULL)
@@ -520,7 +660,7 @@ class Scalpel(
                 Opcodes.INVOKESTATIC,
                 "io/izzel/incision/bridge/IncisionBridge",
                 "dispatch",
-                "(Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
                 false,
             )
             visitInsn(Opcodes.POP)
@@ -582,6 +722,8 @@ class Scalpel(
         }
 
         private fun emitDispatcherCall(phaseSuffix: String = "") {
+            // 宿主 Class 常量由 JVM 以 defining ClassLoader 解析，是 Bridge 跨插件路由的稳定 token。
+            visitLdcInsn(org.objectweb.asm.Type.getObjectType(ownerName))
             visitLdcInsn("$targetSig$phaseSuffix")
             if ((methodAccess and Opcodes.ACC_STATIC) != 0) {
                 visitInsn(Opcodes.ACONST_NULL)
@@ -596,7 +738,7 @@ class Scalpel(
                 Opcodes.INVOKESTATIC,
                 "io/izzel/incision/bridge/IncisionBridge",
                 "dispatch",
-                "(Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
                 false,
             )
         }

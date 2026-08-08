@@ -1,6 +1,5 @@
 package taboolib.module.incision.runtime
 
-import io.izzel.incision.bridge.IncisionBridge
 import taboolib.module.incision.api.MethodCoordinate
 import taboolib.module.incision.api.Resume
 import taboolib.module.incision.api.Theatre
@@ -20,7 +19,7 @@ import java.util.concurrent.ConcurrentHashMap
 object TheatreDispatcher {
 
     @JvmField
-    val BYPASS_MISS: Any = IncisionBridge.bypassMiss()
+    val BYPASS_MISS: Any = CanonicalBridge.bypassMiss()
 
     private val chains = ConcurrentHashMap<String, AdviceChain>()
     private val wildcardEntries = ConcurrentHashMap<String, MutableList<AdviceEntry>>()
@@ -36,17 +35,21 @@ object TheatreDispatcher {
         if (predicateWarnedIds.putIfAbsent(id, true) == null) block()
     }
 
-    // bodies 方法缓存：baseSig → Method（未命中时缓存为 null 的 Optional 包装）
-    private val bodyInvokerCache = ConcurrentHashMap<String, java.util.Optional<java.lang.reflect.Method>>()
+    // bodies 方法缓存：ClassLoader + baseSig → Method（未命中时缓存为 null 的 Optional 包装）。
+    // 同名目标类在不同插件 ClassLoader 下可能各自有 bodies 类，不能只按 baseSig 缓存。
+    private val bodyInvokerCache = ConcurrentHashMap<BodyInvokerKey, java.util.Optional<java.lang.reflect.Method>>()
+
+    private data class BodyInvokerKey(val loader: ClassLoader?, val baseSig: String)
 
     /**
-     * 从 BridgeClassLoader 中查找 bodies 类的对应方法。
+     * 从目标 ClassLoader 或 BridgeClassLoader 中查找 bodies 类的对应方法。
      *
      * @param baseSig 格式如 "com/example/Foo.greet(Ljava/lang/String;I)I"
      * @return bodies 类中的 static Method，或 null
      */
-    fun resolveBodyInvoker(baseSig: String): java.lang.reflect.Method? {
-        val cached = bodyInvokerCache[baseSig]
+    fun resolveBodyInvoker(baseSig: String, targetLoader: ClassLoader?): java.lang.reflect.Method? {
+        val key = BodyInvokerKey(targetLoader, baseSig)
+        val cached = bodyInvokerCache[key]
         if (cached != null) return cached.orElse(null)
         val resolved: java.lang.reflect.Method? = try {
             val parsed = parseOwnerAndMethod(baseSig)
@@ -54,20 +57,31 @@ object TheatreDispatcher {
                 null
             } else {
                 val bodiesClassName = BridgeClassLoader.bodiesClassName(parsed.ownerInternal)
-                if (!BridgeClassLoader.INSTANCE.hasBodies(bodiesClassName)) {
-                    null
-                } else {
-                    val bodiesClass = BridgeClassLoader.INSTANCE.loadClass(bodiesClassName)
+                val bodiesClass = loadBodiesClass(bodiesClassName, targetLoader)
+                if (bodiesClass != null) {
                     val bodyMethodName = parsed.methodName + BodiesClassGenerator.BODY_METHOD_SUFFIX
                     bodiesClass.getMethod(bodyMethodName, Any::class.java, Array<Any>::class.java)
-                }
+                } else null
             }
         } catch (t: Throwable) {
-            Forensics.debug("resolveBodyInvoker 未命中: $baseSig — ${t.message}")
+            Forensics.debug("resolveBodyInvoker 未命中: $baseSig loader=${targetLoader?.javaClass?.name} — ${t.message}")
             null
         }
-        bodyInvokerCache[baseSig] = java.util.Optional.ofNullable(resolved)
+        bodyInvokerCache[key] = java.util.Optional.ofNullable(resolved)
         return resolved
+    }
+
+    private fun loadBodiesClass(bodiesClassName: String, targetLoader: ClassLoader?): Class<*>? {
+        if (targetLoader != null) {
+            try {
+                return Class.forName(bodiesClassName, false, targetLoader)
+            } catch (_: ClassNotFoundException) {
+            } catch (t: Throwable) {
+                Forensics.debug("target loader bodies 加载失败: $bodiesClassName — ${t.message}")
+            }
+        }
+        if (!BridgeClassLoader.INSTANCE.hasBodies(bodiesClassName)) return null
+        return BridgeClassLoader.INSTANCE.loadClass(bodiesClassName)
     }
 
     private data class ParsedSig(val ownerInternal: String, val methodName: String, val desc: String)
@@ -93,6 +107,8 @@ object TheatreDispatcher {
         chains.computeIfAbsent(target.signature) { AdviceChain(target) }
 
     fun register(entry: AdviceEntry) {
+        // owner 的 defining loader 可能属于 Leaf、AuraSkills 或其他第三方插件；按签名登记声明方才能精确回调。
+        CanonicalBridge.registerTarget(TheatreDispatcher::class.java, entry.target.signature)
         val desc = entry.target.descriptor
         if (desc.contains('*')) {
             val ownerName = "${entry.target.owner}.${entry.target.name}"
@@ -113,8 +129,38 @@ object TheatreDispatcher {
         }
     }
 
-    fun unregister(target: MethodCoordinate, id: String): Boolean =
-        chains[target.signature]?.remove(id) ?: false
+    /**
+     * 为 remap 后的运行时坐标建立同一 advice 链的别名。
+     *
+     * Weaver 写入字节码的是运行时 owner/name/descriptor；dispatcher 若只保存 Mojang/Spigot
+     * 声明坐标，会在旧版 NMS 或成员改名时路由成功却找不到 chain。
+     */
+    internal fun registerRuntimeAlias(runtimeTarget: MethodCoordinate, entries: List<AdviceEntry>) {
+        if (entries.isEmpty()) return
+        CanonicalBridge.registerTarget(TheatreDispatcher::class.java, runtimeTarget.signature)
+        val chain = chainOf(runtimeTarget)
+        entries.forEach(chain::add)
+    }
+
+    fun unregister(target: MethodCoordinate, id: String): Boolean {
+        var removed = false
+        // 一个 entry 可能同时存在于声明坐标和 remap 后运行时坐标；按 id 清理全部投影。
+        for ((signature, chain) in chains) {
+            removed = chain.remove(id) || removed
+            if (chain.isEmpty() && chains.remove(signature, chain)) {
+                CanonicalBridge.unregisterTarget(TheatreDispatcher::class.java.classLoader, signature)
+                bodyInvokerCache.keys.removeIf { it.baseSig == signature }
+            }
+        }
+        val ownerName = "${target.owner}.${target.name}"
+        wildcardEntries[ownerName]?.let { entries ->
+            removed = entries.removeIf { it.id == id } || removed
+            if (entries.isEmpty()) wildcardEntries.remove(ownerName, entries)
+        }
+        predicateWarnedIds.remove(id)
+        bodyInvokerCache.keys.removeIf { it.baseSig == target.signature }
+        return removed
+    }
 
     /**
      * 织入字节码的回调入口。返回值用作目标方法的返回值（若被覆盖）。
@@ -139,7 +185,10 @@ object TheatreDispatcher {
         val adviceId = parsedSig.adviceId
         val phase = parsedSig.phase
         val chain = chains[baseSig]
-        if (chain == null) return originalInvoker?.invoke(args)
+        if (chain == null) {
+            if (adviceId != null) Forensics.warn("Site dispatch 未找到宿主 chain: target=$baseSig advice=$adviceId")
+            return originalInvoker?.invoke(args)
+        }
         val isThrowPhase = phase == "TRAIL_THROW"
         val entries = chain.list().filter { e ->
             if (!e.enabled) return@filter false
@@ -148,14 +197,17 @@ object TheatreDispatcher {
             if (isThrowPhase) return@filter e.kind == AdviceKind.TRAIL && e.onThrow
             matchesPhase(e, phase)
         }
-        if (entries.isEmpty()) return originalInvoker?.invoke(args)
+        if (entries.isEmpty()) {
+            if (adviceId != null) Forensics.warn("Site dispatch 未找到 advice: target=$baseSig advice=$adviceId")
+            return originalInvoker?.invoke(args)
+        }
 
         // SPLICE 相位下若 weaver 未注入 invoker，尝试从 bodies side-car 解析
         val effectiveInvoker: ((Array<Any?>) -> Any?)? = originalInvoker ?: run {
             if (phase == "SPLICE") {
                 // 确保 BridgeClassLoader 能解析目标类：用 self 的 CL 注册为 delegate
                 self?.javaClass?.classLoader?.let { BridgeClassLoader.INSTANCE.registerDelegate(it) }
-                val bodyMethod = resolveBodyInvoker(baseSig)
+                val bodyMethod = resolveBodyInvoker(baseSig, self?.javaClass?.classLoader)
                 if (bodyMethod != null) {
                     { callArgs -> bodyMethod.invoke(null, self, callArgs) }
                 } else null
@@ -204,7 +256,12 @@ object TheatreDispatcher {
         else -> true
     }
 
-    fun clear() { chains.clear(); wildcardEntries.clear() }
+    fun clear() {
+        chains.clear()
+        wildcardEntries.clear()
+        predicateWarnedIds.clear()
+        bodyInvokerCache.clear()
+    }
 
     /** 内部 Theatre + Resume 实现 — 链式驱动 */
     private class TheatreImpl(
@@ -241,7 +298,7 @@ object TheatreDispatcher {
 
         /**
          * 执行 advice 上挂载的字符串编译谓词。失败：
-         * - 默认：warnOnce + 视为 true（不阻断）。这样运行期谓词异常不会让 advice 静默失活。
+         * - 默认：warnOnce + 视为 false。选择器错误不能扩大 advice 作用域。
          * - `-Dincision.predicate.strict=true`：抛 [Trauma.Predicate.RuntimeFailure]。
          */
         private fun evalCompiledPredicate(cur: AdviceEntry): Boolean {
@@ -261,7 +318,7 @@ object TheatreDispatcher {
                                 "  source: ${cur.predicateSource ?: "<unknown>"}"
                     )
                 }
-                true
+                false
             }
         }
 

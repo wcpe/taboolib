@@ -1,6 +1,7 @@
 package taboolib.module.incision.weaver.site.matcher
 
 import taboolib.module.incision.weaver.site.SiteSpec
+import taboolib.module.incision.annotation.PatternMode
 import taboolib.module.incision.weaver.site.pattern.InsnStep
 import taboolib.module.incision.weaver.site.pattern.SitePattern
 
@@ -40,7 +41,7 @@ class OpcodeSeqMatcher(private val entries: List<Entry>) : SiteMatcher {
             var matchedOrdinal = 0
             var i = 0
             while (i < events.size) {
-                val end = tryMatchAt(events, i, seq)
+                val end = tryMatchAt(events, i, seq, entry.mode)
                 if (end >= 0) {
                     if (entry.site.ordinal < 0 || entry.site.ordinal == matchedOrdinal) {
                         out += MatchEvent(entry.site, anchorIndex = end)
@@ -58,14 +59,10 @@ class OpcodeSeqMatcher(private val entries: List<Entry>) : SiteMatcher {
     /**
      * 从 events[start] 开始尝试匹配整个 seq；成功返回命中末尾索引，失败返回 -1。
      *
-     * 语义是“以 start 作为首 step 的锚点，后续 step 允许向前跳过不相关指令”，
-     * 而不是“所有 step 必须严格相邻”。
-     *
-     * 这样才能覆盖：
-     * - `LDC;LDC;INVOKEVIRTUAL` 之间夹着 ASTORE / NEW / DUP / ALOAD
-     * - `PUTFIELD repeat=2/5`、`ARRAYLENGTH repeat=2` 之间夹着装载与常量指令
+     * 连续模式不允许跨过任何真实指令；有序子序列模式才会跳过不相关指令。
+     * 两种语义必须在声明期区分，避免旧的宽松搜索产生意外织入。
      */
-    private fun tryMatchAt(events: List<InsnView>, start: Int, seq: List<InsnStep>): Int {
+    private fun tryMatchAt(events: List<InsnView>, start: Int, seq: List<InsnStep>, mode: PatternMode): Int {
         if (start >= events.size || !InsnStepMatcher.matches(seq.first(), events[start])) return -1
         var cursor = start + 1
         var end = start
@@ -77,13 +74,18 @@ class OpcodeSeqMatcher(private val entries: List<Entry>) : SiteMatcher {
                     return@repeat
                 }
                 var matchedAt = -1
-                while (cursor < events.size) {
-                    if (InsnStepMatcher.matches(step, events[cursor])) {
-                        matchedAt = cursor
-                        cursor++
-                        break
-                    }
+                if (mode == PatternMode.CONTIGUOUS) {
+                    if (cursor < events.size && InsnStepMatcher.matches(step, events[cursor])) matchedAt = cursor
                     cursor++
+                } else {
+                    while (cursor < events.size) {
+                        if (InsnStepMatcher.matches(step, events[cursor])) {
+                            matchedAt = cursor
+                            cursor++
+                            break
+                        }
+                        cursor++
+                    }
                 }
                 if (matchedAt < 0) return -1
                 end = matchedAt
@@ -102,5 +104,5 @@ class OpcodeSeqMatcher(private val entries: List<Entry>) : SiteMatcher {
     )
 
     /** 组合 OpcodeSeq site 与其 steps。SiteWeaver 构建时从 site 对应的 SitePattern.OpcodeSeq 拆出 steps。 */
-    data class Entry(val site: SiteSpec, val steps: List<InsnStep>)
+    data class Entry(val site: SiteSpec, val steps: List<InsnStep>, val mode: PatternMode)
 }

@@ -150,8 +150,9 @@ object BodiesClassGenerator {
             original.exceptions?.toTypedArray()
         )
 
-        // 预检：不支持 INVOKESPECIAL 调用 owner 自身 private/实例方法（除 <init>）
-        if (hasUnsupportedInvokeSpecial(original, ownerInternal)) {
+        // 预检：side-car 不是目标类的子类，任何非构造 INVOKESPECIAL（private/super/default）
+        // 都可能违反 verifier 的“current class assignable”约束，必须拒绝生成而不是留到调用时报 VerifyError。
+        if (hasUnsupportedInvokeSpecial(original)) {
             Forensics.debug(
                 "BodiesClassGenerator: 跳过 ${ownerInternal}.${original.name}${original.desc} " +
                     "(包含 INVOKESPECIAL 到自身方法，static 上下文不合法)"
@@ -200,31 +201,19 @@ object BodiesClassGenerator {
         return body
     }
 
-    private fun hasUnsupportedInvokeSpecial(original: MethodNode, ownerInternal: String): Boolean {
+    private fun hasUnsupportedInvokeSpecial(original: MethodNode): Boolean {
         for (insn in original.instructions) {
-            if (insn is MethodInsnNode && insn.opcode == INVOKESPECIAL) {
-                if (insn.owner == ownerInternal && insn.name != "<init>") {
-                    return true
-                }
-            }
+            if (insn is MethodInsnNode && insn.opcode == INVOKESPECIAL && insn.name != "<init>") return true
         }
         return false
     }
 
     /**
-     * JvmtiBackend 的 JVM 内部类名（全斜杠形式）。
-     *
-     * 注意：绝不能写成 `const val "taboolib/module/incision/loader/JvmtiBackend"`。
-     * 因为 const 字符串会被内联，TabooLib 的 Shadow relocation 会把其中的 `taboolib`
-     * token 按「包名（点号）」规则替换为重定位前缀，得到点斜混合的非法名，例如
-     * `group.taboolib/module/incision/loader/JvmtiBackend`，导致生成的 Bodies 类在
-     * defineClass 时抛 ClassFormatError: Illegal class name。
-     *
-     * 改为运行期从已重定位的实际类对象推导：`Class.name` 在重定位后是正确的全限定名，
-     * 仅需把 `.` 换成 `/` 即可得到合法内部名，且对任意重定位前缀都成立。
+     * canonical Bridge 固定存在于 bootstrap/system ClassLoader，服务端类与第三方插件类均可解析。
+     * Side-car body 不能调用插件私有副本中的 JVMTI native：多插件各有独立 ClassLoader，而同一
+     * native image 在 JVM 中只能由一个 loader 绑定，后续插件会得到 UnsatisfiedLinkError。
      */
-    private val JVMTI_BACKEND: String =
-        taboolib.module.incision.loader.JvmtiBackend::class.java.name.replace('.', '/')
+    private const val ACCESS_BRIDGE = "io/izzel/incision/bridge/IncisionBridge"
 
     /**
      * 克隆原方法指令流到 [out]，做 slot 偏移、return 替换、private 字段访问替换。
@@ -234,7 +223,7 @@ object BodiesClassGenerator {
      * - xRETURN（基本类型）：装箱 + ARETURN
      * - RETURN（void）：ACONST_NULL + ARETURN
      * - ARETURN：保持
-     * - GETFIELD/PUTFIELD 访问 private 字段：替换为 JNI 层 nFieldGet/nFieldSet
+     * - GETFIELD/PUTFIELD 访问 private 字段：替换为 canonical Bridge 的反射访问入口
      */
     private fun cloneInstructionsInto(
         out: InsnList,
@@ -252,7 +241,7 @@ object BodiesClassGenerator {
                 is IincInsnNode -> cloned.`var` += 2
             }
 
-            // private 字段访问 → 通过 C 层 JNI 绕过访问控制
+            // private 字段访问 → 通过系统级 Bridge 解析，避免 side-car 不具备宿主 nestmate 权限。
             if (cloned is FieldInsnNode && cloned.owner == ownerInternal && cloned.name in privateFields) {
                 when (cloned.opcode) {
                     GETFIELD -> {
@@ -262,7 +251,7 @@ object BodiesClassGenerator {
                         out.add(LdcInsnNode(cloned.name))
                         out.add(LdcInsnNode(cloned.desc))
                         out.add(MethodInsnNode(
-                            INVOKESTATIC, JVMTI_BACKEND, "nFieldGet",
+                            INVOKESTATIC, ACCESS_BRIDGE, "accessFieldGet",
                             "(Ljava/lang/Object;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
                             false
                         ))
@@ -286,7 +275,7 @@ object BodiesClassGenerator {
                         out.add(LdcInsnNode(cloned.desc))
                         out.add(VarInsnNode(ALOAD, 0)) // 取回 boxedValue
                         out.add(MethodInsnNode(
-                            INVOKESTATIC, JVMTI_BACKEND, "nFieldSet",
+                            INVOKESTATIC, ACCESS_BRIDGE, "accessFieldSet",
                             "(Ljava/lang/Object;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)V",
                             false
                         ))
@@ -298,7 +287,7 @@ object BodiesClassGenerator {
                         out.add(LdcInsnNode(cloned.name))
                         out.add(LdcInsnNode(cloned.desc))
                         out.add(MethodInsnNode(
-                            INVOKESTATIC, JVMTI_BACKEND, "nStaticFieldGet",
+                            INVOKESTATIC, ACCESS_BRIDGE, "accessStaticFieldGet",
                             "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
                             false
                         ))
@@ -316,7 +305,7 @@ object BodiesClassGenerator {
                         out.add(LdcInsnNode(cloned.desc))
                         out.add(VarInsnNode(ALOAD, 0))
                         out.add(MethodInsnNode(
-                            INVOKESTATIC, JVMTI_BACKEND, "nStaticFieldSet",
+                            INVOKESTATIC, ACCESS_BRIDGE, "accessStaticFieldSet",
                             "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)V",
                             false
                         ))

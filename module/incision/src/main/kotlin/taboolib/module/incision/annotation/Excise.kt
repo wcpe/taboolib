@@ -21,12 +21,15 @@ package taboolib.module.incision.annotation
 @Retention(AnnotationRetention.RUNTIME)
 @MustBeDocumented
 annotation class Excise(
-    /** 目标选择器 DSL。 */
-    val scope: String,
+    /** 兼容的 Scope DSL；非空时优先于 [pointcut]。 */
+    val scope: String = "",
+
+    /** v2 结构化选择器；仅在 [scope] 为空时读取。 */
+    val pointcut: Pointcut = Pointcut(),
 
     /** 额外的指令序列约束，用于限制只对满足特定字节码形态的目标方法生效。 */
     val pattern: InsnPattern = InsnPattern([]),
 
     /** 命名标签，可供 DSL、诊断输出或后续匹配事件引用。 */
-    val where: String = "",
+    val predicate: String = "",
 )

@@ -3,6 +3,7 @@ package taboolib.module.incision.gate
 import taboolib.module.incision.diagnostic.Forensics
 import taboolib.module.incision.diagnostic.Trauma
 import taboolib.module.incision.loader.InstrumentationBackend
+import taboolib.module.incision.runtime.CanonicalBridge
 import taboolib.platform.bukkit.Exchanges
 import java.io.File
 import java.io.FileOutputStream
@@ -32,6 +33,24 @@ object GateBootstrapper {
     private var bound: IncisionGateApi? = null
 
     fun current(): IncisionGateApi? = bound
+
+    /**
+     * 释放当前插件对 Gate 的 lease；必须先清 advice 再断开 delegate，避免 system holder 持有旧插件 ClassLoader。
+     */
+    @Synchronized
+    fun release(classLoader: ClassLoader) {
+        val gate = bound ?: return
+        runCatching { gate.healByClassLoader(classLoader) }
+        bound = null
+        // holder 是 JVM 共享对象。任一插件单独 disable 都不能清掉其他 lease 正在使用的 delegate；
+        // canonical Bridge 在最后一个 dispatcher 注销时同步断开 systemHost，二者必须一起归零。
+        if (CanonicalBridge.localLeaseCount() == 0) {
+            val holder = runCatching {
+                Class.forName("taboolib.incision.gate.IncisionGate\$V${gate.apiVersion()}", false, ClassLoader.getSystemClassLoader())
+            }.getOrNull()
+            runCatching { holder?.getMethod("setDelegate", Object::class.java)?.invoke(null, null) }
+        }
+    }
 
     fun bootstrap(apiVersion: Int): IncisionGateApi {
         bound?.let { return it }

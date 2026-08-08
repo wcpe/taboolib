@@ -35,6 +35,14 @@ import kotlin.reflect.KProperty
  */
 object Scalpel {
 
+    /**
+     * 运行时拼接可避免 Shadow 把系统属性键当作 taboolib.* 类名重定位。
+     *
+     * 该键是 JVM 启动协议而不是类坐标，插件重定位后仍必须保持 taboolib.incision.backend 不变。
+     */
+    private val backendProperty =
+        String(charArrayOf('t', 'a', 'b', 'o', 'o', 'l', 'i', 'b')) + ".incision.backend"
+
     operator fun invoke(block: ScalpelBuilder.() -> Unit): ScalpelProvider =
         ScalpelProvider(block, deferred = false, eagerArm = true)
 
@@ -160,62 +168,177 @@ object Scalpel {
      *
      * 同一 owner 多次注册会累积所有 entries 的 weaver；retransform 是幂等的。
      */
-    private val accumulatedTargets = java.util.concurrent.ConcurrentHashMap<String, MutableList<taboolib.module.incision.weaver.Scalpel.AdviceTargetSpec>>()
+    /**
+     * 每个运行时 owner 的当前有效声明，键必须是 AdviceEntry.id。
+     * 只保存折叠后的 AdviceTargetSpec 无法在 heal 时辨认应删除哪条 advice，会把旧织入永久留在类里。
+     */
+    private val activeEntries = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<String, AdviceEntry>>()
     private val activeTokens = java.util.concurrent.ConcurrentHashMap<String, Backend.BackendToken>()
 
+    @Synchronized
     internal fun installWeaver(entries: List<AdviceEntry>) {
         if (entries.isEmpty()) return
-        // Kotlin @JvmStatic 方法有两条调用路径：
-        //   1. 外部类的 static bridge（Java 调用者）
-        //   2. $Companion 的 instance method（Kotlin 调用者）
-        // 自动扩展 companion 目标，确保两条路径都被织入
-        val existingOwners = entries.map { it.target.owner }.toSet()
-        val expanded = mutableListOf<AdviceEntry>()
-        for (e in entries) {
-            expanded += e
-            if (!e.target.owner.endsWith("\$Companion")) {
-                val companionOwner = e.target.owner + "\$Companion"
-                // 避免与 SurgeonScanner.expandTargets 重复
-                if (companionOwner !in existingOwners) {
-                    val companionTarget = e.target.copy(owner = companionOwner)
-                    expanded += e.copy(
-                        id = e.id + "#companion",
-                        target = companionTarget,
-                    )
-                }
-            }
-        }
-        // 注册 companion 扩展条目到 dispatcher
-        for (e in expanded) {
-            if (e.id.endsWith("#companion")) {
-                TheatreDispatcher.register(e)
-            }
-        }
+        // 物理 JVM 入口由 SurgeonScanner 的 KotlinTarget 解析显式生成；DSL 坐标则保持调用方原意。
+        // 后端不得无条件复制 `$Companion`，否则普通方法会多出幽灵计划，maxMatches 也会失真。
+        val expanded = entries
         val backend = resolveBackend()
         val byOwner = expanded.groupBy { it.target.owner }
         for ((owner, group) in byOwner) {
             // NMS remap：把用户写的 net/minecraft/server/MinecraftServer
             // 转换为运行时实际类名 net/minecraft/server/v1_12_R1/MinecraftServer
             val resolvedOwner = RemapRouter.resolveOwner(owner)
-            val newTargets = group.groupBy { it.target }.map { (target, targetEntries) ->
-                ScalpelWeaver.AdviceTargetSpec(
-                    target = target,
-                    kinds = targetEntries.map { it.kind }.toSet(),
-                    sites = targetEntries.mapNotNull { it.siteSpec },
-                )
-            }
-            val allTargets = accumulatedTargets.computeIfAbsent(resolvedOwner) { mutableListOf() }
-            allTargets.addAll(newTargets)
+            val ownerEntries = activeEntries.computeIfAbsent(resolvedOwner) { java.util.concurrent.ConcurrentHashMap() }
+            val previousEntries = HashMap(ownerEntries)
+            group.forEach { ownerEntries[it.id] = it }
             activeTokens.remove(resolvedOwner)?.remove()
-            val weaver = ScalpelWeaver(targetsByOwner = mapOf(resolvedOwner to allTargets.toList()))
-            val token = backend.addTransformer(resolvedOwner) { bytes -> weaver.weave(bytes) }
+            val targets = buildRuntimeTargets(resolvedOwner, ownerEntries.values.toList())
+            val weaver = ScalpelWeaver(
+                targetsByOwner = mapOf(resolvedOwner to targets),
+                useJvmtiBaseline = backend === JvmtiBackend,
+            )
+            val installation = backend.install(resolvedOwner) { bytes -> weaver.weave(bytes) }
+            val token = installation.token
+            if (installation.status !in setOf(Backend.InstallStatus.INSTALLED, Backend.InstallStatus.PENDING_LOAD) || token == null) {
+                ownerEntries.clear()
+                ownerEntries.putAll(previousEntries)
+                if (previousEntries.isNotEmpty()) {
+                    val previousTargets = buildRuntimeTargets(resolvedOwner, previousEntries.values.toList())
+                    val previousWeaver = ScalpelWeaver(
+                        targetsByOwner = mapOf(resolvedOwner to previousTargets),
+                        useJvmtiBaseline = backend === JvmtiBackend,
+                    )
+                    val restored = backend.install(resolvedOwner) { bytes -> previousWeaver.weave(bytes) }
+                    restored.token?.takeIf {
+                        restored.status == Backend.InstallStatus.INSTALLED || restored.status == Backend.InstallStatus.PENDING_LOAD
+                    }?.let { activeTokens[resolvedOwner] = it }
+                    Forensics.warn("installWeaver 已尝试恢复前一合法计划: owner=$resolvedOwner status=${restored.status}")
+                }
+                Forensics.warn("installWeaver 回滚: owner=$owner resolved=$resolvedOwner backend=${backend.name} status=${installation.status} reason=${installation.reason}")
+                continue
+            }
             activeTokens[resolvedOwner] = token
-            backend.retransform(resolvedOwner.replace('/', '.'))
-            Forensics.debug("installWeaver owner=$owner resolved=$resolvedOwner advices=${group.size} total=${allTargets.size} backend=${backend.name}")
+            syncRuntimeAliases(resolvedOwner, ownerEntries.values.toList())
+            Forensics.debug("installWeaver status=${installation.status} owner=$owner resolved=$resolvedOwner advices=${group.size} total=${ownerEntries.size} backend=${backend.name}")
         }
     }
 
+    /**
+     * 从 active plan 删除指定 entry，并从 JVM 原始基线按剩余计划重算类定义。
+     * 任何 owner 重装失败都会恢复调用前快照，避免 dispatcher 已卸载而字节码仍持有旧回调。
+     */
+    @Synchronized
+    internal fun removeWeaver(entries: List<AdviceEntry>): Boolean {
+        if (entries.isEmpty()) return true
+        val backend = resolveBackend()
+        val snapshots = LinkedHashMap<String, Map<String, AdviceEntry>>()
+        val grouped = entries.groupBy { RemapRouter.resolveOwner(it.target.owner) }
+        for ((owner, removing) in grouped) {
+            val ownerEntries = activeEntries[owner] ?: continue
+            snapshots[owner] = HashMap(ownerEntries)
+            removing.forEach { ownerEntries.remove(it.id) }
+            if (!reinstallOwner(owner, ownerEntries.values.toList(), backend)) {
+                snapshots.forEach { (rollbackOwner, snapshot) ->
+                    val rollbackEntries = activeEntries.computeIfAbsent(rollbackOwner) { java.util.concurrent.ConcurrentHashMap() }
+                    rollbackEntries.clear()
+                    rollbackEntries.putAll(snapshot)
+                    reinstallOwner(rollbackOwner, snapshot.values.toList(), backend)
+                }
+                Forensics.warn("removeWeaver 回滚: owner=$owner ids=${removing.map { it.id }}")
+                return false
+            }
+        }
+        return true
+    }
+
+    /** 单 owner 重装；空计划必须主动 retransform，才能把最后一层织入恢复为 JVM 基线。 */
+    private fun reinstallOwner(owner: String, entries: List<AdviceEntry>, backend: Backend): Boolean {
+        activeTokens.remove(owner)?.remove()
+        if (entries.isEmpty()) {
+            activeEntries.remove(owner)
+            return backend.isClassLoaded(owner) == false || backend.retransform(owner.replace('/', '.'))
+        }
+        val targets = buildRuntimeTargets(owner, entries)
+        val weaver = ScalpelWeaver(
+            targetsByOwner = mapOf(owner to targets),
+            useJvmtiBaseline = backend === JvmtiBackend,
+        )
+        val installation = backend.install(owner) { bytes -> weaver.weave(bytes) }
+        val token = installation.token ?: return false
+        if (installation.status !in setOf(Backend.InstallStatus.INSTALLED, Backend.InstallStatus.PENDING_LOAD)) return false
+        activeTokens[owner] = token
+        syncRuntimeAliases(owner, entries)
+        return true
+    }
+
+    /** 把逻辑声明统一翻译为运行时坐标；宿主与 Site 必须经过同一条映射链。 */
+    private fun buildRuntimeTargets(resolvedOwner: String, entries: List<AdviceEntry>): List<ScalpelWeaver.AdviceTargetSpec> {
+        return entries.groupBy { it.target }.map { (target, targetEntries) ->
+            val runtimeTarget = resolveRuntimeTarget(resolvedOwner, target)
+            ScalpelWeaver.AdviceTargetSpec(
+                target = runtimeTarget,
+                kinds = targetEntries.map { it.kind }.toSet(),
+                sites = targetEntries.mapNotNull { it.siteSpec }.map { site ->
+                    val logicalOwner = site.ownerPattern
+                    if (logicalOwner.isBlank()) {
+                        site.copy(target = runtimeTarget, descPattern = RemapRouter.resolveDescriptor(site.descPattern))
+                    } else if (site.matchMode == taboolib.module.incision.annotation.MatchMode.GLOB) {
+                        // owner/name 含通配符时无法查询成员映射表，只递归转换 descriptor 中的确定类型。
+                        site.copy(target = runtimeTarget, descPattern = RemapRouter.resolveDescriptor(site.descPattern))
+                    } else {
+                        val resolvedSiteOwner = RemapRouter.resolveOwner(logicalOwner)
+                        val (siteName, siteDesc) = when (site.anchor) {
+                            taboolib.module.incision.api.Anchor.FIELD_GET,
+                            taboolib.module.incision.api.Anchor.FIELD_PUT -> RemapRouter.resolveField(logicalOwner, site.namePattern, site.descPattern)
+                            taboolib.module.incision.api.Anchor.NEW -> site.namePattern to RemapRouter.resolveDescriptor(site.descPattern)
+                            else -> RemapRouter.resolveMethod(logicalOwner, site.namePattern, site.descPattern)
+                        }
+                        site.copy(
+                            target = runtimeTarget,
+                            ownerPattern = resolvedSiteOwner,
+                            namePattern = siteName,
+                            descPattern = siteDesc,
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    /** 后端确认接受计划后才发布别名，失败安装不得留下一个永远不会被字节码调用的幽灵 chain。 */
+    private fun syncRuntimeAliases(resolvedOwner: String, entries: List<AdviceEntry>) {
+        entries.groupBy { it.target }.forEach { (logicalTarget, targetEntries) ->
+            val runtimeTarget = resolveRuntimeTarget(resolvedOwner, logicalTarget)
+            TheatreDispatcher.registerRuntimeAlias(runtimeTarget, targetEntries)
+        }
+    }
+
+    /** 宿主坐标只允许经过这一条解析链，保证 weave key、Bridge route 与 dispatcher alias 完全一致。 */
+    private fun resolveRuntimeTarget(resolvedOwner: String, target: taboolib.module.incision.api.MethodCoordinate): taboolib.module.incision.api.MethodCoordinate {
+        val (resolvedName, resolvedDescriptor) = RemapRouter.resolveMethod(target.owner, target.name, target.descriptor)
+        return target.copy(owner = resolvedOwner, name = resolvedName, descriptor = resolvedDescriptor)
+    }
+
+    /**
+     * 插件卸载边界：移除全部 transformer 与累计计划，避免下一 ClassLoader 再次叠加旧织入。
+     */
+    fun shutdown() {
+        val backend = resolveBackend()
+        activeTokens.forEach { (owner, token) ->
+            runCatching { token.remove() }
+            // 移除最后一个聚合 transformer 后重新转换，恢复 JVM 的原始定义基线。
+            runCatching { backend.retransform(owner.replace('/', '.')) }
+        }
+        activeTokens.clear()
+        activeEntries.clear()
+    }
+
     private fun resolveBackend(): Backend {
+        // backend 不是按 Java 主版本硬编码：同一 JVM 是否允许动态 attach 取决于启动参数和发行版。
+        // auto 先选标准 Instrumentation，再选无需 attach 的 JVMTI；测试矩阵可显式强制其中之一。
+        when (System.getProperty(backendProperty, "auto").lowercase()) {
+            "instrumentation" -> return InstrumentationBackend
+            "jvmti" -> return JvmtiBackend
+        }
         if (InstrumentationBackend.available()) return InstrumentationBackend
         if (JvmtiBackend.available()) return JvmtiBackend
         Forensics.warn("无可用的 retransform 后端，织入可能失败")

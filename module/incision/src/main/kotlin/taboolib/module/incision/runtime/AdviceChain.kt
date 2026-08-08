@@ -47,6 +47,8 @@ class AdviceChain(val target: MethodCoordinate) {
     private val entries = java.util.concurrent.CopyOnWriteArrayList<AdviceEntry>()
 
     fun add(entry: AdviceEntry) {
+        // 聚合计划重装会再次同步逻辑/运行时别名；同一 id 必须替换而不是重复执行。
+        entries.removeIf { it.id == entry.id }
         entries.add(entry)
         entries.sortByDescending { it.priority }
     }

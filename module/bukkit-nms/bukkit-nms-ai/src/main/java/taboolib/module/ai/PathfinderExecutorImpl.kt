@@ -6,6 +6,7 @@ import org.bukkit.craftbukkit.v1_16_R3.entity.CraftEntity
 import org.bukkit.entity.Entity
 import org.bukkit.entity.LivingEntity
 import org.tabooproject.reflex.Reflex.Companion.getProperty
+import org.tabooproject.reflex.Reflex.Companion.invokeMethod
 import org.tabooproject.reflex.Reflex.Companion.setProperty
 import org.tabooproject.reflex.UnsafeAccess.get
 import org.tabooproject.reflex.UnsafeAccess.put
@@ -144,7 +145,7 @@ class PathfinderExecutorImpl : PathfinderExecutor() {
                     collection.remove(it)
                 }
             }
-            if (a.javaClass.simpleName == "PathfinderCreatorImpl" && a.getProperty<Any>("simpleAI")!!.javaClass.name.contains(name)) {
+            if (a.javaClass.simpleName == "PathfinderCreatorImpl" && (a as PathfinderCreator).simpleAi.javaClass.name.contains(name)) {
                 if (collection is MutableList) {
                     collection.remove(it)
                 } else if (collection is MutableSet) {
@@ -168,7 +169,19 @@ class PathfinderExecutorImpl : PathfinderExecutor() {
     }
 
     private fun getGoal(targetSelector: Any): Collection<*> {
-        return if (v11400) targetSelector.getProperty<Set<*>>("d")!! else targetSelector.getProperty<List<*>>("b")!!
+        return if (v11400) targetSelector.getProperty<Collection<*>>("d")!! else targetSelector.getProperty<Collection<*>>("b")!!
+    }
+
+    private fun replaceGoals(targetSelector: PathfinderGoalSelector, ai: Iterable<*>?) {
+        val goals = ai?.map { wrappedGoal ->
+            requireNotNull(wrappedGoal) { "AI collection cannot contain null values" }
+            wrappedGoal.getProperty<Int>("b")!! to wrappedGoal.getProperty<PathfinderGoal>("a")!!
+        }.orEmpty()
+        val collection = getGoal(targetSelector)
+        require(collection is MutableCollection<*>) { "AI selector goals must be mutable" }
+        // 旧版选择器的字段声明为 Set，保留原集合引用才能避免破坏 NMS 选择器内部状态。
+        collection.clear()
+        goals.forEach { (priority, goal) -> targetSelector.a(priority, goal) }
     }
 
     override fun clearGoalAi(entity: LivingEntity) {
@@ -188,11 +201,11 @@ class PathfinderExecutorImpl : PathfinderExecutor() {
     }
 
     override fun setGoalAi(entity: LivingEntity, ai: Iterable<*>?) {
-        put((getEntityInsentient(entity) as EntityInsentient).goalSelector, pathfinderGoalSelectorSet, ai)
+        replaceGoals((getEntityInsentient(entity) as EntityInsentient).goalSelector, ai)
     }
 
     override fun setTargetAi(entity: LivingEntity, ai: Iterable<*>?) {
-        put((getEntityInsentient(entity) as EntityInsentient).targetSelector, pathfinderGoalSelectorSet, ai)
+        replaceGoals((getEntityInsentient(entity) as EntityInsentient).targetSelector, ai)
     }
 
     override fun navigationMove(entity: LivingEntity, location: Location): Boolean {
@@ -212,7 +225,12 @@ class PathfinderExecutorImpl : PathfinderExecutor() {
     }
 
     override fun navigationReach(entity: LivingEntity): Boolean {
-        return (getPathEntity(entity) as PathEntity).b()
+        val path = getPathEntity(entity) as PathEntity
+        if (!v11400) {
+            // 1.12-1.13 没有可达标记，b() 表示路径已完成；活动路径即为成功生成的路径。
+            return !path.b()
+        }
+        return path.invokeMethod<Boolean>(if (major >= MinecraftVersion.V1_16) "j" else "h")!!
     }
 
     override fun controllerLookAt(entity: LivingEntity, target: Location) {

@@ -6,19 +6,17 @@ import net.minecraft.world.entity.ai.control.JumpControl
 import net.minecraft.world.entity.ai.control.LookControl
 import net.minecraft.world.entity.ai.goal.Goal
 import net.minecraft.world.entity.ai.goal.GoalSelector
+import net.minecraft.world.entity.ai.goal.WrappedGoal
 import net.minecraft.world.entity.ai.navigation.PathNavigation
-import net.minecraft.world.level.pathfinder.Path
 import org.bukkit.Location
 import org.bukkit.craftbukkit.entity.CraftEntity
 import org.bukkit.entity.Entity
 import org.bukkit.entity.LivingEntity
-import org.tabooproject.reflex.Reflex.Companion.getProperty
-import org.tabooproject.reflex.Reflex.Companion.setProperty
-import org.tabooproject.reflex.UnsafeAccess.get
-import org.tabooproject.reflex.UnsafeAccess.put
 import taboolib.module.nms.MinecraftVersion
 import taboolib.module.nms.remap.DynamicOpcode
 import taboolib.module.nms.remap.dynamic
+import taboolib.module.nms.versionAdaptor
+import taboolib.module.nms.versionStrategy
 import java.lang.reflect.Field
 
 /**
@@ -29,73 +27,63 @@ import java.lang.reflect.Field
  */
 class PathfinderExecutorImpl26 : PathfinderExecutor() {
 
-    private var pathEntity: Field? = null
-    private val pathfinderGoalSelectorSet: Field
-    private var controllerJumpCurrent: Field
-
-    init {
-        pathfinderGoalSelectorSet = GoalSelector::class.java.getDeclaredField("availableGoals")
-        pathfinderGoalSelectorSet.isAccessible = true
-        controllerJumpCurrent = JumpControl::class.java.getDeclaredField("jump")
-        controllerJumpCurrent.isAccessible = true
-        for (field in PathNavigation::class.java.declaredFields) {
-            if (field.type == Path::class.java) {
-                pathEntity = field
-                break
-            }
-        }
-    }
+    private val pathEntity: Field = PathNavigation::class.java.getDeclaredField("path").apply { isAccessible = true }
+    private val targetSelectorField: Field = Mob::class.java.getDeclaredField("targetSelector").apply { isAccessible = true }
+    private val controllerJumpCurrent: Field = JumpControl::class.java.getDeclaredField("jump").apply { isAccessible = true }
+    private val goalSelectorAccessor = versionAdaptor<(Mob) -> GoalSelector>(
+        versionStrategy<(Mob) -> GoalSelector>("26.3+", guard = { MinecraftVersion.isHigherOrEqual(MinecraftVersion.V26_3) }) {
+            // 26.x 之间 getter 的编译期签名不一致，运行时优先使用 getter，旧实现再回退到可访问字段。
+            val getter = Mob::class.java.getMethod("getGoalSelector")
+            return@versionStrategy { mob -> getter.invoke(mob) as GoalSelector }
+        },
+        versionStrategy<(Mob) -> GoalSelector>("26.1-26.2") {
+            val field = Mob::class.java.getDeclaredField("goalSelector").apply { isAccessible = true }
+            return@versionStrategy { mob -> field.get(mob) as GoalSelector }
+        },
+    )
 
     override fun getEntityInsentient(entity: LivingEntity): Any {
         return (entity as CraftEntity).handle
     }
 
     override fun getNavigation(entity: LivingEntity): Any {
-        return (getEntityInsentient(entity) as Mob).navigation
+        return (getEntityInsentient(entity) as Mob).getNavigation()
     }
 
     override fun getControllerJump(entity: LivingEntity): Any {
-        val e = getEntityInsentient(entity)
-        if (MinecraftVersion.isUniversal) {
-            return (e as Mob).jumpControl
-        }
-        return (e as Mob).jumpControl
+        return (getEntityInsentient(entity) as Mob).getJumpControl()
     }
 
     override fun getControllerMove(entity: LivingEntity): Any {
-        return (getEntityInsentient(entity) as Mob).moveControl
+        return (getEntityInsentient(entity) as Mob).getMoveControl()
     }
 
     override fun getControllerLook(entity: LivingEntity): Any {
-        val e = getEntityInsentient(entity)
-        if (MinecraftVersion.isUniversal) {
-            return (e as Mob).lookControl
-        }
-        return (e as Mob).lookControl
+        return (getEntityInsentient(entity) as Mob).getLookControl()
     }
 
     override fun getGoalSelector(entity: LivingEntity): Any {
-        return (getEntityInsentient(entity) as Mob).goalSelector
+        return goalSelector(getEntityInsentient(entity) as Mob)
     }
 
     override fun getTargetSelector(entity: LivingEntity): Any {
-        return (getEntityInsentient(entity) as Mob).targetSelector
+        return targetSelector(getEntityInsentient(entity) as Mob)
     }
 
     override fun getPathEntity(entity: LivingEntity): Any {
-        return get(getNavigation(entity), pathEntity!!)!!
+        return (getNavigation(entity) as PathNavigation).path!!
     }
 
     override fun setPathEntity(entity: LivingEntity, pathEntity: Any) {
-        put(getNavigation(entity), this.pathEntity!!, pathEntity)
+        this.pathEntity.set(getNavigation(entity), pathEntity)
     }
 
     override fun addGoalAi(entity: LivingEntity, ai: SimpleAi, priority: Int) {
-        (getEntityInsentient(entity) as Mob).goalSelector.addGoal(priority, pathfinderCreator.createPathfinderGoal(ai) as Goal)
+        goalSelector(getEntityInsentient(entity) as Mob).addGoal(priority, pathfinderCreator.createPathfinderGoal(ai) as Goal)
     }
 
     override fun addTargetAi(entity: LivingEntity, ai: SimpleAi, priority: Int) {
-        (getEntityInsentient(entity) as Mob).targetSelector.addGoal(priority, pathfinderCreator.createPathfinderGoal(ai) as Goal)
+        targetSelector(getEntityInsentient(entity) as Mob).addGoal(priority, pathfinderCreator.createPathfinderGoal(ai) as Goal)
     }
 
     override fun replaceGoalAi(entity: LivingEntity, ai: SimpleAi, priority: Int) {
@@ -108,98 +96,96 @@ class PathfinderExecutorImpl26 : PathfinderExecutor() {
 
     override fun replaceGoalAi(entity: LivingEntity, ai: SimpleAi, priority: Int, name: String?) {
         if (name == null) {
-            removeGoal(priority, (getEntityInsentient(entity) as Mob).goalSelector)
+            removeGoal(priority, goalSelector(getEntityInsentient(entity) as Mob))
         } else {
-            removeGoal(name, (getEntityInsentient(entity) as Mob).goalSelector)
+            removeGoal(name, goalSelector(getEntityInsentient(entity) as Mob))
         }
         addGoalAi(entity, ai, priority)
     }
 
     override fun replaceTargetAi(entity: LivingEntity, ai: SimpleAi, priority: Int, name: String?) {
         if (name == null) {
-            removeGoal(priority, (getEntityInsentient(entity) as Mob).targetSelector)
+            removeGoal(priority, targetSelector(getEntityInsentient(entity) as Mob))
         } else {
-            removeGoal(name, (getEntityInsentient(entity) as Mob).targetSelector)
+            removeGoal(name, targetSelector(getEntityInsentient(entity) as Mob))
         }
         addTargetAi(entity, ai, priority)
     }
 
     override fun removeGoalAi(entity: LivingEntity, priority: Int) {
-        removeGoal(priority, (getEntityInsentient(entity) as Mob).goalSelector)
+        removeGoal(priority, goalSelector(getEntityInsentient(entity) as Mob))
     }
 
     override fun removeTargetAi(entity: LivingEntity, priority: Int) {
-        removeGoal(priority, (getEntityInsentient(entity) as Mob).targetSelector)
+        removeGoal(priority, targetSelector(getEntityInsentient(entity) as Mob))
     }
 
     override fun removeGoalAi(entity: LivingEntity, name: String) {
-        removeGoal(name, (getEntityInsentient(entity) as Mob).goalSelector)
+        removeGoal(name, goalSelector(getEntityInsentient(entity) as Mob))
     }
 
     override fun removeTargetAi(entity: LivingEntity, name: String) {
-        removeGoal(name, (getEntityInsentient(entity) as Mob).targetSelector)
+        removeGoal(name, targetSelector(getEntityInsentient(entity) as Mob))
     }
 
-    private fun removeGoal(name: String, targetSelector: Any) {
-        val collection = getGoal(targetSelector)
-        collection.toList().forEach {
-            val a = it!!.getProperty<Any>("goal", remap = true)!!
-            if (a.javaClass.name.contains(name)) {
-                if (collection is MutableList) {
-                    collection.remove(it)
-                } else if (collection is MutableSet) {
-                    collection.remove(it)
-                }
-            }
-            if (a.javaClass.simpleName == "PathfinderCreatorImpl26" && a.getProperty<Any>("simpleAI")!!.javaClass.name.contains(name)) {
-                if (collection is MutableList) {
-                    collection.remove(it)
-                } else if (collection is MutableSet) {
-                    collection.remove(it)
-                }
+    private fun removeGoal(name: String, selector: GoalSelector) {
+        selector.availableGoals.toList().forEach { wrappedGoal ->
+            val goal = wrappedGoal.goal
+            val matchesSimpleAi = goal.javaClass.simpleName == "PathfinderCreatorImpl26" &&
+                (goal as PathfinderCreator).simpleAi.javaClass.name.contains(name)
+            if (goal.javaClass.name.contains(name) || matchesSimpleAi) {
+                selector.removeGoal(goal)
             }
         }
     }
 
-    private fun removeGoal(priority: Int, targetSelector: Any) {
-        val collection = getGoal(targetSelector)
-        collection.toList().forEach {
-            if (it!!.getProperty<Int>("priority") == priority) {
-                if (collection is MutableList) {
-                    collection.remove(it)
-                } else if (collection is MutableSet) {
-                    collection.remove(it)
-                }
+    private fun removeGoal(priority: Int, selector: GoalSelector) {
+        selector.availableGoals.toList().forEach { wrappedGoal ->
+            if (wrappedGoal.priority == priority) {
+                selector.removeGoal(wrappedGoal.goal)
             }
         }
     }
 
-    private fun getGoal(targetSelector: Any): Collection<*> {
-        return targetSelector.getProperty<Set<*>>("availableGoals", remap = true)!!
+    private fun goalSelector(mob: Mob): GoalSelector {
+        return goalSelectorAccessor()(mob)
+    }
+
+    private fun targetSelector(mob: Mob): GoalSelector {
+        return targetSelectorField.get(mob) as GoalSelector
+    }
+
+    private fun replaceGoals(selector: GoalSelector, ai: Iterable<*>?) {
+        val goals = ai?.map {
+            require(it is WrappedGoal) { "AI collection must contain WrappedGoal values" }
+            it.priority to it.goal
+        }.orEmpty()
+        selector.removeAllGoals { true }
+        goals.forEach { (priority, goal) -> selector.addGoal(priority, goal) }
     }
 
     override fun clearGoalAi(entity: LivingEntity) {
-        get<MutableCollection<*>>((getEntityInsentient(entity) as Mob).goalSelector, pathfinderGoalSelectorSet)?.clear()
+        goalSelector(getEntityInsentient(entity) as Mob).removeAllGoals { true }
     }
 
     override fun clearTargetAi(entity: LivingEntity) {
-        get<MutableCollection<*>>((getEntityInsentient(entity) as Mob).targetSelector, pathfinderGoalSelectorSet)?.clear()
+        targetSelector(getEntityInsentient(entity) as Mob).removeAllGoals { true }
     }
 
     override fun getGoalAi(entity: LivingEntity): Iterable<*>? {
-        return get<Collection<*>>((getEntityInsentient(entity) as Mob).goalSelector, pathfinderGoalSelectorSet)
+        return goalSelector(getEntityInsentient(entity) as Mob).availableGoals
     }
 
     override fun getTargetAi(entity: LivingEntity): Iterable<*>? {
-        return get<Collection<*>>((getEntityInsentient(entity) as Mob).targetSelector, pathfinderGoalSelectorSet)
+        return targetSelector(getEntityInsentient(entity) as Mob).availableGoals
     }
 
     override fun setGoalAi(entity: LivingEntity, ai: Iterable<*>?) {
-        put((getEntityInsentient(entity) as Mob).goalSelector, pathfinderGoalSelectorSet, ai)
+        replaceGoals(goalSelector(getEntityInsentient(entity) as Mob), ai)
     }
 
     override fun setTargetAi(entity: LivingEntity, ai: Iterable<*>?) {
-        put((getEntityInsentient(entity) as Mob).targetSelector, pathfinderGoalSelectorSet, ai)
+        replaceGoals(targetSelector(getEntityInsentient(entity) as Mob), ai)
     }
 
     override fun navigationMove(entity: LivingEntity, location: Location): Boolean {
@@ -235,7 +221,7 @@ class PathfinderExecutorImpl26 : PathfinderExecutor() {
     }
 
     override fun controllerJumpReady(entity: LivingEntity) {
-        (getControllerJump(entity) as JumpControl).setProperty("jump", true, remap = true)
+        controllerJumpCurrent.setBoolean(getControllerJump(entity), true)
     }
 
     override fun controllerJumpCurrent(entity: LivingEntity): Boolean {

@@ -215,6 +215,7 @@ object IncisionBootstrap {
         try {
             // 后续 target 注册、host 绑定与卸载必须复用同一个类句柄，不能再直接链接插件内同名 Bridge。
             CanonicalBridge.bind(bridgeClass)
+            JvmtiBackend.bindCanonicalBridge()
             CanonicalBridge.registerDispatcher(TheatreDispatcher::class.java)
             Forensics.info("IncisionBridge dispatcher 已注册 (CL=${bridgeClass.classLoader ?: "bootstrap"})")
         } catch (t: Throwable) {

@@ -267,7 +267,10 @@ class NMSTranslateImpl : NMSTranslate() {
     override fun getLanguageKey(itemStack: ItemStack): MinecraftLanguage.LanguageKey {
         // 使用 Translatable 接口
         if (isTranslatableSupported) {
-            return MinecraftLanguage.LanguageKey(Type.NORMAL, itemStack.translationKey)
+            // Bukkit ItemStack 不一定是 CraftItemStack，直接读取 translationKey 会访问空的 craftDelegate。
+            // 物品材质已经携带稳定的原版语言键，避免跨版本 CraftItemStack 委托差异。
+            val craftItem = CraftItemStack.asCraftCopy(itemStack)
+            return MinecraftLanguage.LanguageKey(Type.NORMAL, craftItem.type.translationKey)
         }
         // region Legacy Version
         // 1.11 以下版本没有针对空物品的译名，因此直接返回 "air"
@@ -374,9 +377,19 @@ class NMSTranslateImpl : NMSTranslate() {
             return MinecraftLanguage.LanguageKey(Type.DEFAULT, "null")
         }
         return if (MinecraftVersion.isUniversal) {
+            val translationKey = try {
+                potionEffectType.translationKey
+            } catch (_: NoSuchMethodError) {
+                runCatching { potionEffectType.invokeMethod<String>("translationKey", remap = false) }.getOrNull()
+            }
+            val craftDescriptionId = if (translationKey == null) {
+                potionEffectType.invokeMethod<Any>("getHandle", remap = false)?.invokeMethod<String>("getDescriptionId")
+            } else null
             val descriptionId = when {
                 // 使用 Translatable 接口
-                isTranslatableSupported -> potionEffectType.translationKey
+                isTranslatableSupported && translationKey != null -> translationKey
+                // Spigot 1.19.3 - 1.20.2 的 PotionEffectType 尚未实现 Translatable。
+                craftDescriptionId != null -> craftDescriptionId
                 // 1.17
                 // 继续使用 fromId
                 MinecraftVersion.isEqual(MinecraftVersion.V1_17) -> {

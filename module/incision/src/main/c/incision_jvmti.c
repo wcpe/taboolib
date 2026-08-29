@@ -64,6 +64,20 @@ static jint g_extract_len = 0;
 /* 抽取请求绑定目标 jclass，避免并发或嵌套钩子复制到无关类字节码。 */
 static jclass g_extract_target = NULL;
 
+/*
+ * Incision 协议接口不是业务目标。它的嵌套 BackendToken 可能正处于定义过程中；
+ * 若此时再次回调 Java delegate，隔离 ClassLoader 会把同一个接口递归定义两次。
+ * 在 JNI 回调边界提前放行，比 Java 层收到回调后再判断更早、更安全。
+ */
+static int is_backend_protocol_name(const char *name) {
+    static const char suffix[] = "/Backend$BackendToken";
+    size_t name_len;
+    size_t suffix_len = sizeof(suffix) - 1;
+    if (name == NULL) return 0;
+    name_len = strlen(name);
+    return name_len >= suffix_len && strcmp(name + name_len - suffix_len, suffix) == 0;
+}
+
 /* djb2 字符串哈希 */
 static unsigned int hash_str(const char *s) {
     unsigned int h = 5381;
@@ -158,6 +172,9 @@ static void JNICALL classFileLoadHook(
         }
         return; /* 不设置 new_class_data，类保持原样 */
     }
+
+    /* BackendToken 的定义不能参与自身的 native 广播，否则会递归触发 duplicate definition。 */
+    if (is_backend_protocol_name(name)) return;
 
     if (g_callback_mid == NULL || name == NULL) return;
 

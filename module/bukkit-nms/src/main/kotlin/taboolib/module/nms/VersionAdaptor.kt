@@ -32,67 +32,126 @@ package taboolib.module.nms
  * }
  * ```
  *
+ * @property strategies 按优先级排列的候选策略
  * @author sky
  */
-class VersionAdaptor<R>(val strategies: List<Strategy<R>>) {
+class VersionAdaptor<R : Any>(val strategies: List<Strategy<R>>) {
 
     /**
      * 一个候选版本实现。
      * guard 用于显式声明版本边界，避免高版本实现因反射探测成功而误匹配低版本。
+     *
+     * @property name 用于诊断的策略名称
+     * @property guard 策略可参与匹配的版本条件
+     * @property factory 创建并验证实现对象的工厂
      */
-    class Strategy<R>(val name: String, val guard: () -> Boolean, val factory: () -> R)
+    class Strategy<R : Any>(val name: String, val guard: () -> Boolean, val factory: () -> R)
 
+    /**
+     * 已命中的策略。
+     */
     @Volatile
     var resolved: Strategy<R>? = null
+        private set
 
+    /**
+     * 已命中的策略名称，尚未解析时为 `unresolved`。
+     */
     @Volatile
     var selectedName = "unresolved"
+        private set
+
+    @Volatile
+    private var resolvedValue: R? = null
 
     /**
      * 执行分发
      * 首次调用时按声明顺序遍历候选策略，先检查 guard，再尝试构造实现。
      * 第一个 guard 通过且不抛异常的策略会被缓存，并把 [selectedName] 更新为该策略名称。
      * 后续调用直接使用缓存的策略，无 try-catch 开销。
+     *
+     * @return 当前版本对应的实现对象
      */
     operator fun invoke(): R {
-        resolved?.let { return it.factory() }
+        resolvedValue?.let { return it }
         synchronized(this) {
-            resolved?.let { return it.factory() }
+            resolvedValue?.let { return it }
+            val failures = ArrayList<Pair<String, Throwable>>()
             for (strategy in strategies) {
+                if (!strategy.guard()) {
+                    continue
+                }
                 try {
-                    if (!strategy.guard()) {
-                        continue
-                    }
                     val result = strategy.factory()
                     resolved = strategy
                     selectedName = strategy.name
+                    resolvedValue = result
                     return result
-                } catch (_: Throwable) {
+                } catch (ex: Throwable) {
+                    if (!isCompatibilityFailure(ex)) {
+                        throw ex
+                    }
+                    failures += strategy.name to ex
                 }
             }
+            val tried = failures.joinToString { (name, error) -> "$name: ${error.javaClass.simpleName}: ${error.message}" }
+            val message = "No suitable version implementation found${if (tried.isEmpty()) "" else " ($tried)"}"
+            val exception = IllegalStateException(message)
+            failures.forEach { exception.addSuppressed(it.second) }
+            throw exception
         }
-        error("No suitable version implementation found")
+    }
+
+    private fun isCompatibilityFailure(error: Throwable): Boolean {
+        var current: Throwable? = error
+        while (current != null) {
+            if (current is ExceptionInInitializerError) {
+                return false
+            }
+            if (current is ReflectiveOperationException ||
+                current is NoClassDefFoundError ||
+                current is NoSuchMethodError ||
+                current is NoSuchFieldError ||
+                current is IncompatibleClassChangeError ||
+                current is VerifyError
+            ) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
     }
 }
 
 /**
  * 创建版本适配分发器
+ *
+ * @param strategies 按优先级排列的实现工厂
+ * @return 版本适配分发器
  */
-fun <R> versionAdaptor(vararg strategies: () -> R): VersionAdaptor<R> {
+fun <R : Any> versionAdaptor(vararg strategies: () -> R): VersionAdaptor<R> {
     return VersionAdaptor(strategies.mapIndexed { index, strategy -> VersionAdaptor.Strategy("strategy-$index", { true }, strategy) })
 }
 
 /**
  * 创建带名称与版本门禁的版本适配策略
  * name 会在 VersionAdaptor.selectedName 中暴露，便于诊断实际命中的分支。
+ *
+ * @param name 用于诊断的策略名称
+ * @param guard 策略可参与匹配的版本条件
+ * @param factory 创建并验证实现对象的工厂
+ * @return 版本适配策略
  */
-fun <R> versionStrategy(name: String, guard: () -> Boolean = { true }, factory: () -> R): VersionAdaptor.Strategy<R> {
+fun <R : Any> versionStrategy(name: String, guard: () -> Boolean = { true }, factory: () -> R): VersionAdaptor.Strategy<R> {
     return VersionAdaptor.Strategy(name, guard, factory)
 }
 
 /**
  * 创建带显式策略对象的版本适配分发器
+ *
+ * @param strategies 按优先级排列的版本策略
+ * @return 版本适配分发器
  */
-fun <R> versionAdaptor(vararg strategies: VersionAdaptor.Strategy<R>): VersionAdaptor<R> {
+fun <R : Any> versionAdaptor(vararg strategies: VersionAdaptor.Strategy<R>): VersionAdaptor<R> {
     return VersionAdaptor(strategies.toList())
 }

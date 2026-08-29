@@ -20,7 +20,7 @@ class RemapTranslationTabooLib : RemapTranslation() {
     val descriptorCache = HashMap<String, String>()
 
     override fun mapFieldName(owner: String, name: String, descriptor: String): String {
-        val ownerName = owner.replace('/', '.')
+        val ownerName = resolveSpigotName(owner) ?: owner.replace('/', '.')
         // 从 Spigot Mapping 中检索
         for (spigotField in MinecraftVersion.spigotMapping.fields) {
             // 类名符合
@@ -46,7 +46,7 @@ class RemapTranslationTabooLib : RemapTranslation() {
     }
 
     override fun mapMethodName(owner: String, name: String, descriptor: String): String {
-        val ownerName = owner.replace('/', '.')
+        val ownerName = resolveSpigotName(owner) ?: owner.replace('/', '.')
         // 从 Spigot Mapping 中检索
         for (spigotMethod in MinecraftVersion.spigotMapping.methods) {
             // 类名符合
@@ -54,7 +54,7 @@ class RemapTranslationTabooLib : RemapTranslation() {
                 // 获取用于在 Mojang Mapping 中检索的名字（已还原为 Mojang Obf）
                 val obf = if (spigotMethod.translateName == name || spigotMethod.mojangName == name) {
                     // 与字段不同的是，方法需要额外判断描述符
-                    if (checkParameterType(descriptor, spigotMethod.descriptor)) spigotMethod.mojangName
+                    if (parametersMatch(descriptor, spigotMethod.descriptor)) spigotMethod.mojangName
                     else continue
                 } else {
                     continue
@@ -63,7 +63,7 @@ class RemapTranslationTabooLib : RemapTranslation() {
                 val mojangName = translate(owner).replace('/', '.')
                 // 从 Mojang Mapping 中检索
                 for (mojangMethod in MinecraftVersion.paperMapping.methods) {
-                    if (mojangMethod.mojangName == obf && mojangMethod.path == mojangName && checkParameterType(descriptor, mojangMethod.descriptor)) {
+                    if (mojangMethod.mojangName == obf && mojangMethod.path == mojangName && parametersMatch(descriptor, mojangMethod.descriptor)) {
                         // 最终返回 Mojang Deobf 名
                         return mojangMethod.translateName
                     }
@@ -83,14 +83,47 @@ class RemapTranslationTabooLib : RemapTranslation() {
         }
         // 将低版本包名替换为高版本包名
         // net/minecraft/server/v1_17_R1/EntityPlayer -> net/minecraft/server/level/EntityPlayer
-        return if (key.startsWith("net/minecraft/server/v1_")) {
-            // 先转为 Spigot.FullName
-            var spigotName = MinecraftVersion.spigotMapping.classMapSpigotS2F[key.substringAfterLast('/')] ?: return key
-            // 在转为 Mojang.FullName
-            spigotName = MinecraftVersion.paperMapping.classMapSpigotToMojang[spigotName] ?: spigotName
-            spigotName.replace('.', '/')
-        } else {
-            MinecraftVersion.paperMapping.classMapSpigotToMojang[key.replace('/', '.')]?.replace('.', '/') ?: key
+        val paperMapping = MinecraftVersion.paperMapping
+        val exactName = paperMapping.classMapSpigotToMojang[key.replace('/', '.')]
+        if (exactName != null) {
+            return exactName.replace('.', '/')
+        }
+        if (!key.startsWith("net/minecraft/")) {
+            return key
+        }
+        // Spigot 会在版本间移动类的包路径，按当前映射中的类名重新定位后再转为 Mojang 路径。
+        // 先转为 Spigot.FullName
+        var spigotName = resolveSpigotName(key) ?: return key
+        // 在转为 Mojang.FullName
+        spigotName = paperMapping.classMapSpigotToMojang[spigotName] ?: spigotName
+        return spigotName.replace('.', '/')
+    }
+
+    /**
+     * 将历史 Spigot 类路径解析为当前版本的 Spigot 完整类名。
+     */
+    private fun resolveSpigotName(key: String): String? {
+        val className = key.replace('/', '.')
+        val paperMapping = MinecraftVersion.paperMapping
+        if (className in paperMapping.classMapSpigotToMojang) {
+            return className
+        }
+        val spigotName = paperMapping.classMapMojangToSpigot[className]
+        if (spigotName != null) {
+            return spigotName
+        }
+        val simpleName = key.substringAfterLast('/')
+        return paperMapping.classMapSpigotS2F[simpleName]
+    }
+
+    /**
+     * 比较方法参数，无法加载的历史版本类型视为当前候选不匹配。
+     */
+    private fun parametersMatch(descriptor: String, mappingDescriptor: String): Boolean {
+        return try {
+            checkParameterType(descriptor, mappingDescriptor)
+        } catch (_: Throwable) {
+            false
         }
     }
 }

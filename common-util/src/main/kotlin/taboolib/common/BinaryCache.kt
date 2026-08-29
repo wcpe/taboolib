@@ -9,11 +9,25 @@ import java.io.File
 
 object BinaryCache {
 
-    val primarySrcVersion = try {
-        File(BinaryCache::class.java.getProtectionDomain().codeSource.location.file).digest()
+    /** 当前插件的源码文件 */
+    val primarySrcFile = File(TabooLib::class.java.protectionDomain.codeSource.location.file)
+
+    /** 当前插件源码的内容摘要 */
+    val primarySrcDigest = try {
+        primarySrcFile.digest()
     } catch (ex: Throwable) {
         "unknown"
     }
+
+    /** 当前插件源码的缓存标识，避免相同 groupId 的插件共用缓存文件 */
+    val primarySrcId = try {
+        primarySrcFile.absolutePath.digest().take(8)
+    } catch (ex: Throwable) {
+        "unknown"
+    }
+
+    /** 当前插件源码与 TabooLib 版本共同组成的缓存版本 */
+    val primarySrcVersion = PrimitiveSettings.TABOOLIB_VERSION + ':' + primarySrcDigest
 
     fun <T> read(name: String, version: String, block: (bytes: ByteArray) -> T): T? {
         // 是否有缓存文件

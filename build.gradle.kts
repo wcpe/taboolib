@@ -10,11 +10,15 @@ plugins {
 
 // 当前 fork HEAD 的短哈希（7 位），用于拼出发布版本号 6.3.0-<短哈希>，与上游「每个提交一版」的命名保持一致；
 // 取不到（非 git 环境等）时退化为 unknown，不阻塞构建。
-val gitShortHash: String = runCatching {
+val commitId = runCatching {
     ProcessBuilder("git", "rev-parse", "--short=7", "HEAD")
         .directory(rootDir).start()
         .inputStream.bufferedReader().use { it.readText() }.trim()
 }.getOrNull()?.takeIf { it.isNotEmpty() } ?: "unknown"
+
+allprojects {
+    version = "$version-$commitId"
+}
 
 subprojects {
     apply(plugin = "java-library")
@@ -111,7 +115,7 @@ gradle.buildFinished {
 }
 
 subprojects
-    .filter { it.name != "module" && it.name != "platform" && it.name != "expansion" && !it.name.startsWith("impl") }
+    .filter { it.name != "module" && it.name != "platform" && it.name != "expansion" && it.name != "e2e-harness" && !it.name.startsWith("impl") }
     .forEach { proj ->
         proj.publishing { applyToSub(proj) }
     }
@@ -149,7 +153,7 @@ fun PublishingExtension.applyToSub(subProject: Project) {
             version = when {
                 project.hasProperty("devLocal") -> "${project.version}-local-dev"
                 project.hasProperty("dev") -> "${project.version}-dev"
-                else -> "${project.version}-$gitShortHash"
+                else -> "${project.version}"
             }
             // 构件
             artifact(subProject.tasks["kotlinSourcesJar"])

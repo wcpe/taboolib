@@ -3,7 +3,7 @@ package taboolib.module.nms.test
 import org.bukkit.Material
 import org.bukkit.inventory.ItemStack
 import taboolib.common.Test
-import taboolib.common.platform.function.info
+import taboolib.module.nms.NMSItemTag
 import taboolib.platform.util.toNMSKeyAndItemData
 
 /**
@@ -17,7 +17,9 @@ object TestTellrawJson : Test() {
 
     override fun check(): List<Result> {
         return listOf(sandbox("TellrawJson:toNMSKeyAndItemData()") {
-            info(ItemStack(Material.STONE).toNMSKeyAndItemData())
+            val (key, data) = ItemStack(Material.STONE).toNMSKeyAndItemData()
+            check(key == "minecraft:stone")
+            check(NMSItemTag.instance.fromMinecraftJson(data)?.type == Material.STONE)
         })
     }
 }

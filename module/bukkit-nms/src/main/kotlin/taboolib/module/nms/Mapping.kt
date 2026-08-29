@@ -53,6 +53,27 @@ class Mapping(
     }
 
     /**
+     * 根据 Spigot 全限定类名重建唯一的短类名索引
+     * 不同包下存在同名类时不写入索引，避免历史 NMS 路径被错误映射。
+     */
+    internal fun rebuildSpigotSimpleNames() {
+        val ambiguousSpigotNames = HashSet<String>()
+        classMapSpigotS2F.clear()
+        for (spigotName in classMapSpigotToMojang.keys) {
+            if (!spigotName.startsWith("net.minecraft.")) continue
+            val simpleName = spigotName.substringAfterLast('.', "")
+            val previousName = classMapSpigotS2F[simpleName]
+            if (previousName != null && previousName != spigotName) {
+                // simple-name 仅用于唯一类回退，冲突项必须保留原路径匹配。
+                classMapSpigotS2F.remove(simpleName)
+                ambiguousSpigotNames += simpleName
+            } else if (simpleName !in ambiguousSpigotNames) {
+                classMapSpigotS2F[simpleName] = spigotName
+            }
+        }
+    }
+
+    /**
      * 字段映射
      */
     data class Field(val path: String, val mojangName: String, val translateName: String) {
@@ -208,6 +229,7 @@ class Mapping(
                     }
                 }
             }
+            mapping.rebuildSpigotSimpleNames()
             PrimitiveIO.debug("Paper 映射表已加载，用时 {0} 毫秒。", System.currentTimeMillis() - time)
             PrimitiveIO.debug("Classes: {0}, Fields: {1}, Methods: {2}", mapping.classMapSpigotToMojang.size, mapping.fields.size, mapping.methods.size)
             return mapping
@@ -218,7 +240,7 @@ class Mapping(
          * 从 Exchanges 空间中读取数据
          */
         fun exchange(id: String): Mapping {
-            return Mapping(
+            val mapping = Mapping(
                 Exchanges["$id#classMapSpigotS2F"],
                 Exchanges["$id#classMapSpigotToMojang"],
                 Exchanges.getOrPut("$id#classMapMojangS2F") { Exchanges.get<Map<String, String>>("$id#classMapSpigotToMojang").values.associateBy { it.substringAfterLast('.', "") }.toMutableMap() },
@@ -226,6 +248,11 @@ class Mapping(
                 Exchanges.get<List<Array<String>>>("$id#fields").mapTo(LinkedList()) { Field(it[0], it[1], it[2]) },
                 Exchanges.get<List<Array<String>>>("$id#methods").mapTo(LinkedList()) { Method(it[0], it[1], it[2], it[3]) }
             )
+            // 旧版 TabooLib 可能已交换完整 Paper 映射，但没有生成 Spigot 短类名索引。
+            if (mapping.classMapSpigotS2F.isEmpty() && mapping.classMapSpigotToMojang.isNotEmpty()) {
+                mapping.rebuildSpigotSimpleNames()
+            }
+            return mapping
         }
     }
     // endregion

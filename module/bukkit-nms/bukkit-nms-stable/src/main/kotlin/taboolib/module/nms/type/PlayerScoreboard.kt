@@ -2,7 +2,6 @@ package taboolib.module.nms.type
 
 import org.bukkit.entity.Player
 import taboolib.module.nms.NMSScoreboard
-import taboolib.module.nms.nmsProxy
 
 /**
  * 玩家记分板信息缓存
@@ -10,7 +9,7 @@ import taboolib.module.nms.nmsProxy
 class PlayerScoreboard(val player: Player) {
 
     /** 记分板工具 */
-    private val nmsScoreboard = nmsProxy<NMSScoreboard>()
+    private val nmsScoreboard = NMSScoreboard.instance
 
     /** 当前标题 */
     private var currentTitle = ""
@@ -71,8 +70,9 @@ class PlayerScoreboard(val player: Player) {
      */
     fun setPrefix(prefix: String, target: Player?) {
         this.prefix = prefix
+        val createTeam = !isCreated
         this.isCreated = true
-        nmsScoreboard.updateTeam(player, prefix, suffix, color, !isCreated, target)
+        nmsScoreboard.updateTeam(player, prefix, suffix, color, createTeam, target)
     }
 
     /**
@@ -80,8 +80,9 @@ class PlayerScoreboard(val player: Player) {
      */
     fun clearPrefix(target: Player?) {
         this.prefix = ""
+        val createTeam = !isCreated
         this.isCreated = true
-        nmsScoreboard.updateTeam(player, "", suffix, color, !isCreated, target)
+        nmsScoreboard.updateTeam(player, "", suffix, color, createTeam, target)
     }
 
     /**
@@ -89,8 +90,9 @@ class PlayerScoreboard(val player: Player) {
      */
     fun setSuffix(suffix: String, target: Player?) {
         this.suffix = suffix
+        val createTeam = !isCreated
         this.isCreated = true
-        nmsScoreboard.updateTeam(player, prefix, suffix, color, !isCreated, target)
+        nmsScoreboard.updateTeam(player, prefix, suffix, color, createTeam, target)
     }
 
     /**
@@ -98,8 +100,9 @@ class PlayerScoreboard(val player: Player) {
      */
     fun clearSuffix(target: Player?) {
         this.suffix = ""
+        val createTeam = !isCreated
         this.isCreated = true
-        nmsScoreboard.updateTeam(player, prefix, "", color, !isCreated, target)
+        nmsScoreboard.updateTeam(player, prefix, "", color, createTeam, target)
     }
 
     /**
@@ -107,7 +110,8 @@ class PlayerScoreboard(val player: Player) {
      */
     fun setColor(color: ChatColorFormat, target: Player?) {
         this.color = color
+        val createTeam = !isCreated
         this.isCreated = true
-        nmsScoreboard.updateTeam(player, prefix, suffix, color, !isCreated, target)
+        nmsScoreboard.updateTeam(player, prefix, suffix, color, createTeam, target)
     }
 }

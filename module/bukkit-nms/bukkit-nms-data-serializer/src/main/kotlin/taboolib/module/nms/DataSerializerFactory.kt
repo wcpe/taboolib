@@ -16,7 +16,9 @@ interface DataSerializerFactory {
     companion object {
 
         val instance by unsafeLazy {
-            if (MinecraftVersion.majorLegacy >= 12005) {
+            if (MinecraftVersion.isUnobfuscated) {
+                nmsProxy<DataSerializerFactory>("{name}26")
+            } else if (MinecraftVersion.majorLegacy >= 12005) {
                 nmsProxy<DataSerializerFactory>("{name}12005")
             } else {
                 nmsProxy<DataSerializerFactory>("{name}Legacy")

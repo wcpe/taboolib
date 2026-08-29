@@ -16,6 +16,9 @@ import java.util.concurrent.ConcurrentHashMap
 @Suppress("UNCHECKED_CAST")
 object PlatformFactory {
 
+    /** 当前插件的跨平台注入缓存名称 */
+    val injectCacheName = "inject/platform-${BinaryCache.primarySrcId}"
+
     /** 已被唤醒的类 */
     val awokenMap: ConcurrentHashMap<String, Any>
         get() = TabooLib.getAwakenedClasses() as ConcurrentHashMap
@@ -47,7 +50,7 @@ object PlatformFactory {
 
             val time = System.nanoTime()
             // 是否有缓存
-            val useCache = BinaryCache.read("inject/platform", BinaryCache.primarySrcVersion) { injectByCache(it, time) }
+            val useCache = BinaryCache.read(injectCacheName, BinaryCache.primarySrcVersion) { injectByCache(it, time) }
             if (useCache == null) {
                 inject(includedClasses, time)
             }
@@ -209,7 +212,7 @@ object PlatformFactory {
         writer.writeList(awakeClassList)
 
         // 保存缓存
-        BinaryCache.save("inject/platform", BinaryCache.primarySrcVersion, writer.toByteArray())
+        BinaryCache.save(injectCacheName, BinaryCache.primarySrcVersion, writer.toByteArray())
 
         // 调试信息
         if (PrimitiveSettings.IS_DEBUG_MODE) {

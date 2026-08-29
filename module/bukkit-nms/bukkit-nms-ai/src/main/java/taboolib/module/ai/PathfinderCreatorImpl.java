@@ -23,6 +23,11 @@ public class PathfinderCreatorImpl extends net.minecraft.server.v1_16_R3.Pathfin
     }
 
     @Override
+    public SimpleAi getSimpleAi() {
+        return simpleAI;
+    }
+
+    @Override
     public boolean a() {
         return simpleAI.shouldExecute();
     }

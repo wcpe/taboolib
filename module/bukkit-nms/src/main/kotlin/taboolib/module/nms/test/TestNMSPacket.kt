@@ -9,6 +9,8 @@ import taboolib.common.event.InternalEventBus
 import taboolib.common.io.isDevelopmentMode
 import taboolib.common.platform.Awake
 import taboolib.module.nms.*
+import java.awt.Point
+import java.util.concurrent.TimeUnit
 
 /**
  * TabooLib
@@ -42,20 +44,46 @@ object TestNMSPacket : Test() {
             // 测试连接
             result += sandbox("NMS:getConnection(Player)") { PacketSender.getConnection(player) }
             // 测试发包
+            // KeepAlive 在旧版和新版都有对应的数据包，且不依赖已经移除或改名的视距包。
+            // 真实客户端会自动回应 KeepAlive，改用无回包副作用的生命值同步包验证发送链路。
+            val packetName = when {
+                MinecraftVersion.isUnobfuscated -> "network.protocol.game.ClientboundSetHealthPacket"
+                MinecraftVersion.isUniversal -> "ClientboundSetHealthPacket"
+                else -> "PacketPlayOutUpdateHealth"
+            }
+            val createPacket = { nmsClass(packetName).invokeConstructor(player.health.toFloat(), player.foodLevel, player.saturation) }
             result += sandbox("NMS:sendPacketBlocking(Player, Any)") {
-                try {
-                    player.sendPacketBlocking(nmsClass("ClientboundBlockChangedAckPacket").invokeConstructor(0))
-                } catch (ex: ClassNotFoundException) {
-                    player.sendPacketBlocking(nmsClass("PacketPlayOutViewDistance").invokeConstructor(8))
-                }
+                player.sendPacketBlocking(createPacket())
             }
             result += sandbox("NMS:sendBundlePacketBlocking(Player, Any)") {
-                try {
-                    player.sendBundlePacketBlocking(nmsClass("ClientboundBlockChangedAckPacket").invokeConstructor(0))
-                } catch (ex: ClassNotFoundException) {
-                    player.sendBundlePacketBlocking(nmsClass("PacketPlayOutViewDistance").invokeConstructor(8))
-                }
+                player.sendBundlePacketBlocking(createPacket())
             }
+            result += sandbox("NMS:sendPacket(Player, Any)") {
+                val future = player.sendPacket(createPacket())
+                future.get(5, TimeUnit.SECONDS)
+                check(future.isDone && !future.isCompletedExceptionally)
+            }
+            result += sandbox("NMS:sendBundlePacket(Player, Any)") {
+                val future = player.sendBundlePacket(createPacket())
+                future.get(5, TimeUnit.SECONDS)
+                check(future.isDone && !future.isCompletedExceptionally)
+            }
+            result += sandbox("NMS:Packet.readWriteOverwrite") {
+                val point = Point(1, 2)
+                val packet = PacketImpl(point)
+                check(packet.read<Int>("x", remap = false) == 1)
+                packet.write("x", 3, remap = false)
+                check(point.x == 3)
+                val replacement = Point(4, 5)
+                packet.overwrite(replacement)
+                check(packet.source === replacement)
+                check(packet.name == "Point")
+                check(packet.fullyName == Point::class.java.name)
+            }
+            result += sandbox("NMS:Packet.syntheticClass") {
+                check(PacketImpl(Runnable {}).isUnmappedSyntheticClass())
+            }
+            result += sandbox("NMS:ProtocolHandler.isInjected") { check(ProtocolHandler.isInjected()) }
             // 测试事件
             result += if (testSend) Success.of("NMS:PacketSendEvent") else Failure.of("NMS:PacketSendEvent", "NOT_TRIGGERED")
             result += if (testSendHandshake) Success.of("NMS:PacketSendEvent.Handshake") else Failure.of("NMS:PacketSendEvent.Handshake", "NOT_TRIGGERED")

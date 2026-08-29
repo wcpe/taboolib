@@ -1,7 +1,5 @@
 package taboolib.module.nms.remap
 
-import org.apache.commons.lang3.JavaVersion
-import org.apache.commons.lang3.SystemUtils
 import org.objectweb.asm.Type
 import taboolib.common.reflect.ClassHelper
 import java.util.concurrent.ConcurrentHashMap
@@ -16,7 +14,8 @@ import java.util.concurrent.ConcurrentHashMap
 object RemapHelper {
 
     private val descriptorTypeCacheMap = ConcurrentHashMap<String, Array<Class<*>>>()
-    private val autoboxing = SystemUtils.isJavaVersionAtLeast(JavaVersion.JAVA_1_5)
+    // TabooLib 最低运行时已是 Java 8，固定开启自动装箱以避开旧 Commons Lang 无法识别新 Java 的问题。
+    private const val autoboxing = true
 
     /**
      * 根据「方法描述符」中的「参数」检查与目标「方法描述符」中的「参数」是否匹配

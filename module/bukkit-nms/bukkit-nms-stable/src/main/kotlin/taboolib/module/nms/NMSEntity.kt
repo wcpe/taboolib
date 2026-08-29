@@ -63,7 +63,7 @@ class NMSEntityImpl : NMSEntity() {
     /**
      * 1.19.3, 1.20 -> BuiltInRegistries.VILLAGER_PROFESSION
      */
-    val villagerProfessionBuiltInRegistries by unsafeLazy { nmsClass("BuiltInRegistries").getProperty<Any>("VILLAGER_PROFESSION", isStatic = true)!! }
+    val villagerProfessionBuiltInRegistries by unsafeLazy { nmsClass("core.registries.BuiltInRegistries").getProperty<Any>("VILLAGER_PROFESSION", isStatic = true)!! }
 
     /**
      * 1.17, 1.19.2 -> IRegistry.VILLAGER_PROFESSION
@@ -72,7 +72,7 @@ class NMSEntityImpl : NMSEntity() {
 
     @Suppress("UNCHECKED_CAST")
     override fun <T : Entity> spawnEntity(location: Location, entity: Class<T>, randomizeData: Boolean, callback: Consumer<T>): T {
-        return if (MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_20)) {
+        return if (MinecraftVersion.versionId >= 12002) {
             location.world?.spawn(location, entity, randomizeData) { callback.accept(it) } ?: error("world is null")
         } else {
             val craftWorld = location.world as org.bukkit.craftbukkit.v1_12_R1.CraftWorld
@@ -269,12 +269,11 @@ class NMSEntityImpl : NMSEntity() {
     /**
      * 1.17 .. 1.20 获取村民的语言文件节点（只获取职业节点）
      */
-    @Suppress("UNCHECKED_CAST")
     private fun getVillagerLocaleKey3(nmsEntity: Any): String {
         nmsEntity as net.minecraft.world.entity.npc.EntityVillager
         val registry = runCatching { villagerProfessionBuiltInRegistries }.getOrElse { villagerProfessionIRegistry }
-        registry as net.minecraft.core.IRegistry<Any>
-        return registry.getKey(nmsEntity.villagerData.profession)!!.getProperty<String>("path")!!
+        val key = registry.invokeMethod<Any>("getKey", nmsEntity.villagerData.profession, remap = true)!!
+        return key.getProperty<String>("path")!!
     }
 }
 // endregion

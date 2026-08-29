@@ -8,3 +8,11 @@ bin
 doc
 .claude/
 nul
+.e2e/
+/libraries/
+/logs/
+/versions/
+scripts/e2e/bot/node_modules/
+scripts/e2e/__pycache__/
+e2e-done.marker
+.opencode/tmp

@@ -35,7 +35,7 @@ val groupId = "taboolib".substringBefore(".$taboolibId")
  * 例如：org.tabooproject.taboolib
  */
 val taboolibPath: String
-    get() = "$groupId.$taboolibId"
+    get() = if (groupId == taboolibId) taboolibId else "$groupId.$taboolibId"
 
 /**
  * 特定类的组名

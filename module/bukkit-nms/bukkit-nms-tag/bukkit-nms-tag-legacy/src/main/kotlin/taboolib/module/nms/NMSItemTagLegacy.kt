@@ -25,7 +25,13 @@ open class NMSItemTagLegacy : NMSItemTag() {
     val nbtTagIntArrayGetter = unreflectGetter<NBTTagIntArray12>(if (MinecraftVersion.isUniversal) "c" else "data")
     val nbtTagLongArrayGetter =
         if (MinecraftVersion.isLower(MinecraftVersion.V1_12)) null
-        else unreflectGetter<NBTTagLongArray12>(if (MinecraftVersion.isUniversal) "c" else "b")
+        else unreflectGetter<NBTTagLongArray12>(
+            when {
+                MinecraftVersion.isUniversal -> "c"
+                MinecraftVersion.major == MinecraftVersion.V1_13 || MinecraftVersion.major == MinecraftVersion.V1_14 -> "f"
+                else -> "b"
+            }
+        )
 
     override fun newItemTag(): ItemTag {
         return ItemTag()
@@ -44,7 +50,7 @@ open class NMSItemTagLegacy : NMSItemTag() {
         }
         val nmsItem = getNMSCopy(empty)
         nmsItem.tag = net.minecraft.server.v1_12_R1.MojangsonParser.parse(json)
-        return getBukkitCopy(empty)
+        return getBukkitCopy(nmsItem)
     }
 
     override fun getNMSCopy(itemStack: ItemStack): NMSItemStack12 {

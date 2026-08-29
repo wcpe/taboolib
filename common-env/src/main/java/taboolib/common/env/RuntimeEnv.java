@@ -41,9 +41,11 @@ public class RuntimeEnv {
             boolean loadKotlinCoroutines = !KOTLIN_COROUTINES_VERSION.equals("null");
             // 非隔离模式
             if (!PrimitiveSettings.IS_ISOLATED_MODE) {
-                // 启用重定向
-                rel.add(new JarRelocation(KOTLIN_ID + ".", PrimitiveSettings.getRelocatedKotlinVersion() + "."));
-                rel.add(new JarRelocation(KOTLIN_COROUTINES_ID + ".", PrimitiveSettings.getRelocatedKotlinCoroutinesVersion() + "."));
+                // 若未跳过 Kotlin 重定向，则启用重定向
+                if (!PrimitiveSettings.SKIP_KOTLIN_RELOCATE) {
+                    rel.add(new JarRelocation(KOTLIN_ID + ".", PrimitiveSettings.getRelocatedKotlinVersion() + "."));
+                    rel.add(new JarRelocation(KOTLIN_COROUTINES_ID + ".", PrimitiveSettings.getRelocatedKotlinCoroutinesVersion() + "."));
+                }
                 // 启用环境检查
                 // 在隔离模式下不会检查 Kotlin 环境，只要定义版本必定加载
                 if (TabooLib.isKotlinEnvironment()) loadKotlin = false;

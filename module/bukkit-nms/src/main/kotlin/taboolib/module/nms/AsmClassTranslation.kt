@@ -77,7 +77,10 @@ class AsmClassTranslation(val source: String) {
             }
             // 使用旧版本转译器
             else {
-                RemapTranslationLegacy()
+                RemapTranslationLegacy(
+                    sourceName = classReader.className.replace('/', '.'),
+                    sourceParents = listOf(classReader.superName, *classReader.interfaces),
+                )
             }
             classReader.accept(ClassRemapper(classWriter, remapper), 0)
             var newBytes = classWriter.toByteArray()
@@ -118,6 +121,6 @@ class AsmClassTranslation(val source: String) {
         /**
          * NMS remap 转换策略缓存 ID。
          */
-        const val REMAP_TRANSLATION_CACHE_ID = "20260531-legacy-nms-package-fallback"
+        const val REMAP_TRANSLATION_CACHE_ID = "20260827-paper-exchange-simple-names"
     }
 }

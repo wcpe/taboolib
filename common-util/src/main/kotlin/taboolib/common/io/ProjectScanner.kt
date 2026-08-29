@@ -96,19 +96,19 @@ val runningExactClasses: List<ReflexClass>
  */
 val runningResourcesInJar by lazy(LazyThreadSafetyMode.NONE) {
     val (map, time) = execution {
-        val map = TabooLib::class.java.protectionDomain.codeSource.location.getResources()
+        val maps = mutableListOf(TabooLib::class.java.protectionDomain.codeSource.location.getResourceView())
         // 额外扫描入口
         System.getProperty("taboolib.scan")?.split(",")?.forEach { name ->
             if (name.isEmpty()) return@forEach
             PrimitiveIO.println("Scanning $name")
-            map += Class.forName(name).protectionDomain.codeSource.location.getResources()
+            maps += Class.forName(name).protectionDomain.codeSource.location.getResourceView()
         }
         // 扫描额外主类
         val main = System.getProperty("taboolib.main")
         if (main != null) {
-            map += Class.forName(main).protectionDomain.codeSource.location.getResources()
+            maps += Class.forName(main).protectionDomain.codeSource.location.getResourceView()
         }
-        map
+        ResourceMap.combine(maps)
     }
     PrimitiveIO.debug("ProjectScanner 扫描到 {0} 个资源文件，用时 {1} 毫秒。", map.size, time)
     map
@@ -118,11 +118,7 @@ val runningResourcesInJar by lazy(LazyThreadSafetyMode.NONE) {
  * 当前插件的所有资源文件
  */
 val runningResources: Map<String, ByteArray>
-    get() {
-        val map = LinkedHashMap(runningResourcesInJar)
-        map.putAll(extraLoadedResources)
-        return map
-    }
+    get() = ResourceMap.combine(listOf(runningResourcesInJar, extraLoadedResources) + extraLoadedResourceViews)
 
 /**
  * 由 ClassAppender 加载的文件
@@ -140,6 +136,11 @@ var extraLoadedClasses = ConcurrentHashMap<String, ReflexClass>()
 var extraLoadedResources = ConcurrentHashMap<String, ByteArray>()
 
 /**
+ * 由 ClassAppender 加载的资源文件视图
+ */
+internal val extraLoadedResourceViews = CopyOnWriteArrayList<Map<String, ByteArray>>()
+
+/**
  * 获取 URL 下的所有类
  */
 fun URL.getClasses(classLoader: ClassLoader = ClassAppender.getClassLoader()): Map<String, ReflexClass> {
@@ -153,7 +154,7 @@ fun URL.getClasses(classLoader: ClassLoader = ClassAppender.getClassLoader()): M
     }
     // 是文件
     if (srcFile.isFile) {
-        val srcVersion = srcFile.digest()
+        val srcVersion = if (srcFile.absoluteFile == BinaryCache.primarySrcFile.absoluteFile) BinaryCache.primarySrcDigest else srcFile.digest()
         // 从二进制缓存中读取
         val classMap = BinaryCache.read(srcFile.nameWithoutExtension, srcVersion) {
             ReflexClassMap.deserializeFromBytes(it) { name -> Class.forName(name, false, classLoader) }
@@ -213,6 +214,41 @@ fun URL.getResources(): MutableMap<String, ByteArray> {
 }
 
 /**
+ * 获取 URL 下的所有文件，资源内容在首次访问时读取
+ *
+ * @return 按需读取内容的资源视图
+ */
+internal fun URL.getResourceView(): Map<String, ByteArray> {
+    val srcFile = try {
+        File(toURI())
+    } catch (ex: IllegalArgumentException) {
+        File((openConnection() as JarURLConnection).jarFileURL.toURI())
+    } catch (ex: URISyntaxException) {
+        File(path)
+    }
+    return ResourceMap.of {
+        val providers = LinkedHashMap<String, () -> ByteArray>()
+        if (srcFile.isFile) {
+            JarFile(srcFile).use { jar ->
+                jar.stream().filter { !it.name.endsWith(".class") && !it.isDirectory }.forEach {
+                    val name = it.name
+                    providers[name] = {
+                        JarFile(srcFile).use { currentJar -> currentJar.getInputStream(currentJar.getJarEntry(name)).readBytes() }
+                    }
+                }
+            }
+        } else {
+            srcFile.walk().filter { !it.isDirectory }.forEach {
+                val file = it
+                val relativePath = file.relativeTo(srcFile).path.replace('\\', '/')
+                providers[relativePath] = { file.readBytes() }
+            }
+        }
+        providers
+    }
+}
+
+/**
  * 初始化函数
  */
 private fun init() {
@@ -221,7 +257,7 @@ private fun init() {
         if (!isExternal) {
             extraLoadedFiles += file
             extraLoadedClasses += file.toURI().toURL().getClasses(loader)
-            extraLoadedResources += file.toURI().toURL().getResources()
+            extraLoadedResourceViews += file.toURI().toURL().getResourceView()
         }
     }
 }

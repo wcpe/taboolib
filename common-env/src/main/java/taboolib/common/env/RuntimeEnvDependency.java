@@ -147,6 +147,14 @@ public class RuntimeEnvDependency {
         }
         // 使用 Aether 处理依赖
         if (isAetherFound) {
+            // 非传递依赖的本地路径是确定的，热启动时无需为每个插件重复构建 Aether 依赖图。
+            if (!transitive) {
+                File localFile = new Artifact(url).findFile(new File(defaultLibrary));
+                if (localFile.isFile()) {
+                    AetherResolver.inject(localFile, relocation, external);
+                    return;
+                }
+            }
             AetherResolver.of(repository).resolve(url, scope, transitive, ignoreOptional).forEach(file -> {
                 try {
                     AetherResolver.inject(file, relocation, external);
@@ -168,6 +176,14 @@ public class RuntimeEnvDependency {
         downloader.setDependencyScopes(scope);
         downloader.setTransitive(transitive);
         downloader.setExcludes(excludes);
+        Dependency dep = new Dependency(artifact.getGroupId(), artifact.getArtifactId(), artifact.getVersion(), DependencyScope.RUNTIME);
+        dep.setType(artifact.getExtension());
+        dep.setExternal(external);
+        // 非传递依赖只需检查并注入自身 JAR，无需额外读取和解析 POM。
+        if (!transitive) {
+            downloader.injectClasspath(Collections.singleton(dep));
+            return;
+        }
         // 解析依赖
         String pomPath = String.format("%s/%s/%s/%s-%s.pom", artifact.getGroupId().replace('.', '/'), artifact.getArtifactId(), artifact.getVersion(), artifact.getArtifactId(), artifact.getVersion());
         File pomFile = new File(baseDir, pomPath);
@@ -180,14 +196,7 @@ public class RuntimeEnvDependency {
             downloader.loadDependencyFromInputStream(new URL(repository + "/" + pomPath).openStream());
         }
         // 加载自身
-        Dependency dep = new Dependency(artifact.getGroupId(), artifact.getArtifactId(), artifact.getVersion(), DependencyScope.RUNTIME);
-        dep.setType(artifact.getExtension());
-        dep.setExternal(external);
-        if (transitive) {
-            downloader.injectClasspath(downloader.loadDependency(downloader.getRepositories(), dep));
-        } else {
-            downloader.injectClasspath(Collections.singleton(dep));
-        }
+        downloader.injectClasspath(downloader.loadDependency(downloader.getRepositories(), dep));
     }
 
     /**

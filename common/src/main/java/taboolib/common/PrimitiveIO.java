@@ -122,7 +122,19 @@ public class PrimitiveIO {
      * @param hashFile 哈希文件
      */
     public static boolean validation(File file, File hashFile) {
-        return file.exists() && hashFile.exists() && PrimitiveIO.readFile(hashFile).startsWith(PrimitiveIO.getHash(file));
+        if (!file.exists() || !hashFile.exists()) {
+            return false;
+        }
+        String expectedHash = PrimitiveIO.readFile(hashFile).trim();
+        String cacheKey = "taboolib.validation." + PrimitiveIO.getHash(file.getAbsolutePath() + ':' + file.length() + ':' + file.lastModified());
+        if (expectedHash.equals(System.getProperty(cacheKey))) {
+            return true;
+        }
+        boolean valid = expectedHash.startsWith(PrimitiveIO.getHash(file));
+        if (valid) {
+            System.setProperty(cacheKey, expectedHash);
+        }
+        return valid;
     }
 
     /**

@@ -19,6 +19,7 @@ include(
     "module:bukkit-nms",
     "module:bukkit-nms:bukkit-nms-ai",
     "module:bukkit-nms:bukkit-nms-data-serializer",
+    "module:bukkit-nms:bukkit-nms-data-serializer:nms-data-serializer-26",
     "module:bukkit-nms:bukkit-nms-data-serializer:nms-data-serializer-12005",
     "module:bukkit-nms:bukkit-nms-data-serializer:nms-data-serializer-legacy",
     "module:bukkit-nms:bukkit-nms-legacy",
@@ -59,7 +60,8 @@ include(
     "module:incision",
 
     // 用户空间
-    "userspace:geek-tool"
+    "userspace:geek-tool",
+    "userspace:e2e-harness"
 )
 include(
     "platform:platform-application",

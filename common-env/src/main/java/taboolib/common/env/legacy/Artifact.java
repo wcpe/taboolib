@@ -1,5 +1,6 @@
 package taboolib.common.env.legacy;
 
+import java.io.File;
 import java.util.Collections;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -56,6 +57,18 @@ public class Artifact {
 
     public String getExtension() {
         return extension;
+    }
+
+    /**
+     * 获取该构件在本地 Maven 仓库中的文件。
+     *
+     * @param baseDir 本地 Maven 仓库根目录
+     * @return 构件文件
+     */
+    public File findFile(File baseDir) {
+        String classifierSuffix = classifier.isEmpty() ? "" : "-" + classifier;
+        String fileName = artifactId + "-" + version + classifierSuffix + "." + extension;
+        return new File(baseDir, groupId.replace('.', '/') + "/" + artifactId + "/" + version + "/" + fileName);
     }
 
     static String get(String value, String defaultValue) {

@@ -1,11 +1,9 @@
 package taboolib.module.nms
 
-import net.minecraft.advancements.critereon.CriterionConditionBlock
 import net.minecraft.core.component.DataComponentType
 import net.minecraft.core.component.DataComponents
 import net.minecraft.core.registries.BuiltInRegistries
 import net.minecraft.nbt.*
-import net.minecraft.resources.MinecraftKey
 import net.minecraft.world.item.AdventureModePredicate
 import net.minecraft.world.item.component.CustomData
 import org.bukkit.craftbukkit.v1_21_R3.CraftRegistry
@@ -20,6 +18,19 @@ import kotlin.jvm.optionals.getOrNull
  * [NMSItemTag] 的实现类
  */
 class NMSItemTagImpl : NMSItemTag() {
+
+    private val adventurePredicateFactory = versionAdaptor<(List<String>) -> AdventureModePredicate>(
+        // 1.21.11 起 critereon 包更名为 criterion
+        versionStrategy("1.21.11+", guard = { MinecraftVersion.versionId >= 12111 }) {
+            createAdventurePredicateFactory12111()
+        },
+        versionStrategy("1.21.5+") {
+            createAdventurePredicateFactory12105()
+        },
+        versionStrategy("legacy") {
+            createLegacyAdventurePredicateFactory()
+        },
+    )
 
     override fun newItemTag(): ItemTag {
         return ItemTag12005()
@@ -38,7 +49,7 @@ class NMSItemTagImpl : NMSItemTag() {
         val compound = if (versionId >= 12105) {
             dynamic(
                 DynamicOpcode.INVOKESTATIC,
-                "net.minecraft.nbt.MojangsonParser#parseComponentFully(java.lang.String;)net.minecraft.nbt.NBTTagCompound;",
+                "net.minecraft.nbt.MojangsonParser#parseCompoundFully(java.lang.String;)net.minecraft.nbt.NBTTagCompound;",
                 json
             )
         } else {
@@ -103,22 +114,62 @@ class NMSItemTagImpl : NMSItemTag() {
         componentType: DataComponentType<AdventureModePredicate>,
     ): ItemStack {
         val nmsItem = getNMSCopy(itemStack)
-        val predicates = blocks.mapNotNull { blockName ->
-            val key = MinecraftKey.parse(blockName)
-            val blockHolder = BuiltInRegistries.BLOCK.get(key).getOrNull()
-            blockHolder?.let { holder ->
-                CriterionConditionBlock.a.block()
-                    .of(BuiltInRegistries.BLOCK, holder.value())
-                    .build()
-            }
-        }
-        val predicate = if (versionId >= 12105) {
-            dynamic(DynamicOpcode.INVOKESPECIAL, "net.minecraft.world.item.AdventureModePredicate(java.util.List;)V", predicates)
-        } else {
-            dynamic(DynamicOpcode.INVOKESPECIAL, "net.minecraft.world.item.AdventureModePredicate(java.util.List;Z)V", predicates, true)
-        } as AdventureModePredicate
-        nmsItem.set(componentType, predicate)
+        nmsItem.set(componentType, adventurePredicateFactory()(blocks))
         return getBukkitCopy(nmsItem)
+    }
+
+    /**
+     * 按版本包名前缀构造冒险模式谓词，避免硬编码 1.21.11 重命名的 `criterion` 包。
+     */
+    private fun createAdventurePredicateFactory12111(): (List<String>) -> AdventureModePredicate {
+        return createModernAdventurePredicateFactory { registry, block ->
+            val builder = dynamic(DynamicOpcode.INVOKESTATIC, "net.minecraft.advancements.criterion.BlockPredicate\$Builder#block()net.minecraft.advancements.criterion.BlockPredicate\$Builder;")
+            dynamic(DynamicOpcode.INVOKEVIRTUAL, "net.minecraft.advancements.criterion.BlockPredicate\$Builder#of(net.minecraft.core.HolderGetter;java.util.Collection;)net.minecraft.advancements.criterion.BlockPredicate\$Builder;", builder, registry, listOf(block))
+            dynamic(DynamicOpcode.INVOKEVIRTUAL, "net.minecraft.advancements.criterion.BlockPredicate\$Builder#build()net.minecraft.advancements.criterion.BlockPredicate;", builder)
+        }
+    }
+
+    // 1.21.5 - 1.21.10 仍使用拼写错误的 critereon 包名。
+    private fun createAdventurePredicateFactory12105(): (List<String>) -> AdventureModePredicate {
+        return createModernAdventurePredicateFactory { registry, block ->
+            val builder = dynamic(DynamicOpcode.INVOKESTATIC, "net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder#block()net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder;")
+            dynamic(DynamicOpcode.INVOKEVIRTUAL, "net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder#of(net.minecraft.core.HolderGetter;java.util.Collection;)net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder;", builder, registry, listOf(block))
+            dynamic(DynamicOpcode.INVOKEVIRTUAL, "net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder#build()net.minecraft.advancements.critereon.CriterionConditionBlock;", builder)
+        }
+    }
+
+    // 新版谓词仅包名不同，方块注册表的解析协议保持一致。
+    private fun createModernAdventurePredicateFactory(buildPredicate: (registry: Any, block: Any) -> Any?): (List<String>) -> AdventureModePredicate {
+        val registry = BuiltInRegistries.BLOCK
+        return { blocks ->
+            val predicates = blocks.mapNotNull { blockName ->
+                val key = dynamic(DynamicOpcode.INVOKESTATIC, "net.minecraft.resources.Identifier#tryParse(java.lang.String;)net.minecraft.resources.Identifier;", blockName)
+                    ?: return@mapNotNull null
+                val optional = dynamic(DynamicOpcode.INVOKEVIRTUAL, "net.minecraft.core.RegistryMaterials#getOptional(net.minecraft.resources.Identifier;)java.util.Optional;", registry, key) as Optional<*>
+                val block = optional.orElse(null) ?: return@mapNotNull null
+                buildPredicate(registry, block)
+            }
+            dynamic(DynamicOpcode.INVOKESPECIAL, "net.minecraft.world.item.AdventureModePredicate(java.util.List;)V", predicates) as AdventureModePredicate
+        }
+    }
+
+    /**
+     * 1.20.5 之前的旧版实现：通过 Collection 构建并带布尔形参。
+     */
+    private fun createLegacyAdventurePredicateFactory(): (List<String>) -> AdventureModePredicate {
+        return { blocks ->
+            val predicates = blocks.mapNotNull { blockName ->
+                val key = dynamic(DynamicOpcode.INVOKESTATIC, "net.minecraft.resources.Identifier#tryParse(java.lang.String;)net.minecraft.resources.Identifier;", blockName)
+                    ?: return@mapNotNull null
+                val registry = BuiltInRegistries.BLOCK
+                val block = dynamic(DynamicOpcode.INVOKEVIRTUAL, "net.minecraft.core.RegistryMaterials#get(net.minecraft.resources.Identifier;)java.lang.Object;", registry, key)
+                    ?: return@mapNotNull null
+                val builder = dynamic(DynamicOpcode.INVOKESTATIC, "net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder#block()net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder;")
+                dynamic(DynamicOpcode.INVOKEVIRTUAL, "net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder#of(java.util.Collection;)net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder;", builder, listOf(block))
+                dynamic(DynamicOpcode.INVOKEVIRTUAL, "net.minecraft.advancements.critereon.CriterionConditionBlock\$Builder#build()net.minecraft.advancements.critereon.CriterionConditionBlock;", builder)
+            }
+            dynamic(DynamicOpcode.INVOKESPECIAL, "net.minecraft.world.item.AdventureModePredicate(java.util.List;Z)V", predicates, true) as AdventureModePredicate
+        }
     }
 
     override fun setItemCanBreak(itemStack: ItemStack, blocks: List<String>): ItemStack {

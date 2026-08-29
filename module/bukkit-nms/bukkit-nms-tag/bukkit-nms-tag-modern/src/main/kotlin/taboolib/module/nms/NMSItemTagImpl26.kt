@@ -1,15 +1,11 @@
 package taboolib.module.nms
 
-import net.minecraft.advancements.criterion.BlockPredicate
-import net.minecraft.core.HolderGetter
 import net.minecraft.core.component.DataComponentType
 import net.minecraft.core.component.DataComponents
-import net.minecraft.core.registries.BuiltInRegistries
 import net.minecraft.nbt.*
 import net.minecraft.resources.Identifier
 import net.minecraft.world.item.AdventureModePredicate
 import net.minecraft.world.item.component.CustomData
-import net.minecraft.world.level.block.Block
 import org.bukkit.craftbukkit.CraftRegistry
 import org.bukkit.craftbukkit.inventory.CraftItemStack
 import org.bukkit.inventory.ItemStack
@@ -20,8 +16,19 @@ import kotlin.jvm.optionals.getOrNull
 
 /**
  * [NMSItemTag] 的实现类，使用 Mojang Mapping
+ *
+ * @author sky
  */
-class NMSItemTagImpl2 : NMSItemTag() {
+class NMSItemTagImpl26 : NMSItemTag() {
+
+    private val adventurePredicateFactory = versionAdaptor<(List<String>) -> AdventureModePredicate>(
+        versionStrategy("26.2+", guard = { MinecraftVersion.isHigherOrEqual(MinecraftVersion.V26_2) }) {
+            createAdventurePredicateFactory("advancements.predicates.BlockPredicate")
+        },
+        versionStrategy("26.1") {
+            createAdventurePredicateFactory("advancements.criterion.BlockPredicate")
+        },
+    )
 
     override fun newItemTag(): ItemTag {
         return ItemTag12005()
@@ -87,32 +94,33 @@ class NMSItemTagImpl2 : NMSItemTag() {
         componentType: DataComponentType<AdventureModePredicate>,
     ): ItemStack {
         val nmsItem = getNMSCopy(itemStack)
-        val predicates = blocks.mapNotNull { blockName ->
-            val key = Identifier.parse(blockName)
-            // 懒得导服务端
-            @Suppress("unchecked_cast")
-            val blockHolder = (dynamic(
-                DynamicOpcode.INVOKEVIRTUAL,
-                "net.minecraft.core.Registry#get(net.minecraft.resources.Identifier;)java.util.Optional;",
-                key
-            ) as Optional<Any>).getOrNull()
-            blockHolder?.let { holder ->
-                val builder = BlockPredicate.Builder.block()
-                val block = dynamic(
-                    DynamicOpcode.INVOKEVIRTUAL,
-                    "net.minecraft.core.Holder\$Reference#value()java.lang.Object;",
-                    holder
-                ) as Block
-                // 懒得管
-                @Suppress("unchecked_cast")
-                val blockRegistry = dynamic(DynamicOpcode.GETSTATIC, "net.minecraft.core.registries.BuiltInRegistries#BLOCK:net.minecraft.core.DefaultedRegistry;") as HolderGetter<Block>
-                builder.of(blockRegistry, block)
-                builder.build()
-            }
-        }
-        val predicate = dynamic(DynamicOpcode.INVOKESPECIAL, "net.minecraft.world.item.AdventureModePredicate(java.util.List;)V", predicates) as AdventureModePredicate
-        nmsItem.set(componentType, predicate)
+        nmsItem.set(componentType, adventurePredicateFactory()(blocks))
         return getBukkitCopy(nmsItem)
+    }
+
+    private fun createAdventurePredicateFactory(blockPredicateName: String): (List<String>) -> AdventureModePredicate {
+        val builderClass = nmsClass("$blockPredicateName\$Builder")
+        val blockMethod = builderClass.getMethod("block")
+        val ofMethod = builderClass.methods.first {
+            it.name == "of" && it.parameterCount == 2 && Collection::class.java.isAssignableFrom(it.parameterTypes[1])
+        }
+        val buildMethod = builderClass.getMethod("build")
+        val blockRegistry = nmsClass("core.registries.BuiltInRegistries").getField("BLOCK").get(null)
+        val getOptionalMethod = blockRegistry.javaClass.methods.first {
+            it.name == "getOptional" && it.parameterTypes.contentEquals(arrayOf(Identifier::class.java))
+        }
+        val constructor = AdventureModePredicate::class.java.getConstructor(List::class.java)
+        return { blocks ->
+            val predicates = blocks.mapNotNull { blockName ->
+                val key = Identifier.tryParse(blockName) ?: return@mapNotNull null
+                val optional = getOptionalMethod.invoke(blockRegistry, key) as Optional<*>
+                val block = optional.orElse(null) ?: return@mapNotNull null
+                val builder = blockMethod.invoke(null)
+                ofMethod.invoke(builder, blockRegistry, listOf(block))
+                buildMethod.invoke(builder)
+            }
+            constructor.newInstance(predicates)
+        }
     }
 
     override fun setItemCanBreak(itemStack: ItemStack, blocks: List<String>): ItemStack {

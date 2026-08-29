@@ -26,6 +26,35 @@ internal object CanonicalBridge {
         invoke("registerLocalDispatcher", arrayOf<Class<*>>(Class::class.java), dispatcherClass)
     }
 
+    fun registerNativeBackend(backendClass: Class<*>, ownsNative: Boolean): Boolean =
+        invokeResult(
+            "registerNativeBackend",
+            arrayOf<Class<*>>(Class::class.java, Boolean::class.javaPrimitiveType!!),
+            backendClass,
+            ownsNative,
+        ) as? Boolean ?: false
+
+    fun transformNative(loader: ClassLoader?, name: String, bytes: ByteArray): ByteArray? =
+        invokeResult(
+            "transformNative",
+            arrayOf<Class<*>>(ClassLoader::class.java, String::class.java, ByteArray::class.java),
+            loader,
+            name,
+            bytes,
+        ) as? ByteArray
+
+    fun invokeNative(operation: String, vararg args: Any?): Any? =
+        invokeResult(
+            "invokeNative",
+            arrayOf<Class<*>>(String::class.java, Array<Any?>::class.java),
+            operation,
+            args,
+        )
+
+    fun unregisterNativeBackend(backendClass: Class<*>) {
+        invoke("unregisterNativeBackend", arrayOf<Class<*>>(Class::class.java), backendClass)
+    }
+
     fun unregisterDispatcher(classLoader: ClassLoader) {
         invoke("unregisterLocalDispatcher", arrayOf<Class<*>>(ClassLoader::class.java), classLoader)
     }

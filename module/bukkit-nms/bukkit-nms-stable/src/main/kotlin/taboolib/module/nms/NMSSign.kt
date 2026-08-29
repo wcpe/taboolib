@@ -1,22 +1,9 @@
 package taboolib.module.nms
 
-import net.minecraft.core.BlockPos
-import net.minecraft.network.protocol.game.ClientboundOpenSignEditorPacket
 import org.bukkit.Material
 import org.bukkit.block.Block
 import org.bukkit.entity.Player
-import org.bukkit.event.player.PlayerQuitEvent
-import taboolib.common.Inject
-import taboolib.common.platform.Platform
-import taboolib.common.platform.PlatformSide
-import taboolib.common.platform.event.SubscribeEvent
-import taboolib.common.platform.function.submit
 import taboolib.common.util.unsafeLazy
-import taboolib.platform.BukkitPlugin
-import taboolib.platform.Folia
-import taboolib.platform.FoliaExecutor
-import java.lang.reflect.Constructor
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 捕获玩家的牌子输入
@@ -55,7 +42,7 @@ fun Player.inputSign(lines: Array<String> = arrayOf(), callback: (lines: Array<S
             sendBlockChange(location, location.block.type, location.block.data)
         }
     }
-    nmsProxy<NMSSign>().openSignEditor(this, location.block)
+    NMSSign.instance.openSignEditor(this, location.block)
 }
 
 private fun sign(): Material {
@@ -86,73 +73,29 @@ private fun Array<String>.formatSign(line: Int): Array<String> {
  */
 abstract class NMSSign {
 
+    /**
+     * 将网络组件反序列化为文本。
+     *
+     * @param component 服务端网络组件
+     * @return 组件对应的文本
+     */
     abstract fun deserialize(component: Any): String
 
+    /**
+     * 向玩家打开牌子编辑器。
+     *
+     * @param player 目标玩家
+     * @param block 牌子方块
+     */
     abstract fun openSignEditor(player: Player, block: Block)
-}
 
-// region NMSSignImpl
-class NMSSignImpl : NMSSign() {
+    companion object {
 
-    val constructorPacketOutSignEditor: Constructor<*> by unsafeLazy {
-        net.minecraft.server.v1_16_R1.PacketPlayOutOpenSignEditor::class.java.getDeclaredConstructor(
-            net.minecraft.server.v1_16_R1.BlockPosition::class.java,
-            java.lang.Boolean.TYPE
-        )
-    }
-
-    override fun deserialize(component: Any): String {
-        return net.minecraft.server.v1_12_R1.IChatBaseComponent.ChatSerializer.a(component as net.minecraft.server.v1_12_R1.IChatBaseComponent)
-    }
-
-    override fun openSignEditor(player: Player, block: Block) {
-        val blockPosition = if (MinecraftVersion.isUnobfuscated) {
-            BlockPos(block.x, block.y, block.z)
-        } else {
-            net.minecraft.server.v1_12_R1.BlockPosition(block.x, block.y, block.z)
-        }
-        // 1.20 -> 正反牌子
-        if (MinecraftVersion.isUnobfuscated) {
-            player.sendPacket(ClientboundOpenSignEditorPacket(blockPosition as BlockPos, true))
-        } else if (MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_20)) {
-            player.sendPacket(constructorPacketOutSignEditor.newInstance(blockPosition, true))
-        } else {
-            player.sendPacket(net.minecraft.server.v1_12_R1.PacketPlayOutOpenSignEditor(blockPosition as net.minecraft.server.v1_12_R1.BlockPosition))
+        /**
+         * 当前服务端对应的牌子实现。
+         */
+        val instance by unsafeLazy {
+            nmsProxy<NMSSign>(if (MinecraftVersion.isUnobfuscated) "{name}Impl26" else "{name}Impl")
         }
     }
 }
-// endregion
-
-// region NMSSignListener
-@Inject
-@PlatformSide(Platform.BUKKIT)
-private object NMSSignListener {
-
-    /** 用户输入 */
-    val callback = ConcurrentHashMap<String, (Array<String>) -> Unit>()
-
-    @SubscribeEvent
-    fun onQuit(e: PlayerQuitEvent) {
-        callback.remove(e.player.name)
-    }
-
-    @SubscribeEvent
-    fun onReceive(e: PacketReceiveEvent) {
-        if ((e.packet.name == "PacketPlayInUpdateSign" || e.packet.name == "ServerboundSignUpdatePacket") && callback.containsKey(e.player.name)) {
-            val function = callback.remove(e.player.name) ?: return
-            val lines = when {
-                MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_17) -> e.packet.read<Array<String>>("lines")!!
-                MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_9) -> e.packet.read<Array<String>>("b")!!
-                else -> e.packet.read<Array<Any>>("b")!!.map { nmsProxy<NMSSign>().deserialize(it) }.toTypedArray()
-            }
-            if (Folia.isFolia) {
-                FoliaExecutor.REGION_SCHEDULER.run(BukkitPlugin.getInstance(), e.player.location) {
-                    function.invoke(lines)
-                }
-            } else {
-                submit { function.invoke(lines) }
-            }
-        }
-    }
-}
-// endregion

@@ -90,13 +90,14 @@ fun releaseResourceFile(source: String, replace: Boolean = false, target: String
  * @param replace 是否覆盖文件
  */
 fun releaseResourceFolder(prefix: String, replace: Boolean = false) {
-    runningResources.forEach { (path, bytes) ->
+    runningResources.entries.forEach { resource ->
+        val path = resource.key
         if (path.startsWith(prefix)) {
             val file = File(getDataFolder(), path)
             if (file.exists() && !replace) {
                 return@forEach
             }
-            newFile(file).writeBytes(bytes)
+            newFile(file).writeBytes(resource.value)
         }
     }
 }

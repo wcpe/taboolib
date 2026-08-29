@@ -46,7 +46,23 @@ public class MeteorInjector implements Closeable {
     private static Field GAME_PROFILE_FROM_PACKET;
     private static final Field CHANNELS_LIST = getField(SERVER_CONNECTION_CLASS, List.class, 1);
 
-    private static final Method GAME_PROFILE_ID = getMethod(GameProfile.class, MinecraftVersion.INSTANCE.getVersionId() > 12108 ? "id" : "getId");
+    private static final Method GAME_PROFILE_ID;
+
+    static {
+        Method method = null;
+        try {
+            method = GameProfile.class.getMethod("getId");
+        } catch (NoSuchMethodException ignored) {
+            try {
+                method = GameProfile.class.getMethod("id");
+            } catch (NoSuchMethodException ignored2) {
+            }
+        }
+        if (method == null) {
+            throw new ExceptionInInitializerError("[MeteorInjector] Cannot find GameProfile id accessor.");
+        }
+        GAME_PROFILE_ID = method;
+    }
 
     private static final String IDENTIFIER_PREFIX = "meteor-injector-";
 

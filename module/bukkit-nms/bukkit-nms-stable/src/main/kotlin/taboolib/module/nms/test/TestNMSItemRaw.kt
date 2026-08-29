@@ -19,10 +19,12 @@ object TestNMSItemRaw : Test() {
     override fun check(): List<Result> {
         return listOf(
             sandbox("NMSItemRaw:setDisplayName()") {
-                ItemStack(Material.STONE).itemMeta!!.setDisplayNameComponent(Components.text("啥比"))
+                val meta = ItemStack(Material.STONE).itemMeta!!.setDisplayNameComponent(Components.text("啥比"))
+                check(meta.displayName == "啥比")
             },
             sandbox("NMSItemRaw:setLore()") {
-                ItemStack(Material.STONE).itemMeta!!.setLoreComponents(listOf(Components.text("啥比")))
+                val meta = ItemStack(Material.STONE).itemMeta!!.setLoreComponents(listOf(Components.text("啥比")))
+                check(meta.lore == listOf("啥比"))
             }
         )
     }

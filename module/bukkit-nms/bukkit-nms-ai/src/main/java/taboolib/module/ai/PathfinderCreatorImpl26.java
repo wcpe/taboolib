@@ -23,6 +23,11 @@ public class PathfinderCreatorImpl26 extends net.minecraft.world.entity.ai.goal.
     }
 
     @Override
+    public SimpleAi getSimpleAi() {
+        return simpleAI;
+    }
+
+    @Override
     public boolean canUse() {
         return simpleAI.shouldExecute();
     }

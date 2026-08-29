@@ -29,7 +29,9 @@ fun ItemStack.toNMSKeyAndItemData(): Pair<String, String> {
         // key
         val nmsItem = nmsItemStack.invokeMethod<Any>("getItem")!!
         val nmsKey = classNMSItem.getProperty<Any>("REGISTRY", isStatic = true)!!.invokeMethod<Any>("b", nmsItem)!!
-        nmsKey.invokeMethod<String>("getKey")!!
+        val key = nmsKey.invokeMethod<String>("getKey")!!
+        // 1.12 的注册表只返回路径，Tellraw 物品数据仍要求使用命名空间键。
+        if (':' in key) key else "minecraft:$key"
     }
     return nmsKey to NMSItemTag.instance.toMinecraftJson(this)
 }

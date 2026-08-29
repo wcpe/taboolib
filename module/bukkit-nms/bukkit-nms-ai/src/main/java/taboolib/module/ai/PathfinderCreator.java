@@ -8,4 +8,9 @@ public interface PathfinderCreator {
 
     Object createPathfinderGoal(SimpleAi ai);
 
+    /**
+     * 获取当前 Goal 绑定的 SimpleAi。
+     */
+    SimpleAi getSimpleAi();
+
 }

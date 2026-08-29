@@ -10,7 +10,12 @@ import org.bukkit.potion.PotionEffectType
 import org.bukkit.potion.PotionType
 import taboolib.common.Test
 import taboolib.library.xseries.XMaterial
+import taboolib.module.nms.MinecraftVersion
+import taboolib.module.nms.getDisplayName
 import taboolib.module.nms.getI18nName
+import taboolib.module.nms.getKey
+import taboolib.module.nms.getLanguageKey
+import taboolib.module.nms.getName
 import taboolib.platform.util.buildItem
 import taboolib.platform.util.modifyMeta
 
@@ -54,6 +59,21 @@ object TestNMSTranslate : Test() {
         )
         val world = worlds[0]
         return listOf(
+            sandbox("NMSTranslate:itemKeys") {
+                val stone = XMaterial.STONE.parseItem()!!
+                val key = stone.getKey()
+                check(key == "stone") { "Unexpected stone key: $key" }
+                // 1.12 使用旧版语言文件节点，1.13 起才统一为带命名空间的节点。
+                val stoneLanguageKey = if (MinecraftVersion.isLower(MinecraftVersion.V1_13)) {
+                    "tile.stone.stone.name"
+                } else {
+                    "block.minecraft.stone"
+                }
+                val languageKey = stone.getLanguageKey().path
+                check(languageKey == stoneLanguageKey) { "Unexpected stone language key: $languageKey" }
+                val named = buildItem(XMaterial.STONE) { name = "E2E_NAME" }
+                check(named.getName() == "E2E_NAME")
+            },
             sandbox("NMSTranslate:getI18nName(ItemStack)") {
                 assert(items.count { it.getI18nName() == "NO_LOCALE" })
             },
@@ -64,11 +84,19 @@ object TestNMSTranslate : Test() {
                 assert(PotionEffectType.values().filterNotNull().count { it.getI18nName() == "NO_LOCALE" })
             },
             sandbox("NMSTranslate:getI18nName(Entity)") {
-                val entity1 = world.spawnEntity(world.spawnLocation, EntityType.ZOMBIE)
+                // 和平难度禁止生成敌对生物，使用被动生物仍能覆盖实体语言键解析。
+                val entity1 = world.spawnEntity(world.spawnLocation, EntityType.COW)
                 val entity2 = world.spawnEntity(world.spawnLocation, EntityType.VILLAGER) as Villager
                 val entity3 = world.spawnEntity(world.spawnLocation, EntityType.VILLAGER) as Villager
                 entity3.profession = Villager.Profession.FARMER
-                assert(listOf(entity1, entity2, entity3).count { it.getI18nName() == "NO_LOCALE" })
+                val entities = listOf(entity1, entity2, entity3)
+                try {
+                    assert(entities.count { it.getI18nName() == "NO_LOCALE" })
+                    entity1.customName = "E2E_ENTITY"
+                    check(entity1.getDisplayName() == "E2E_ENTITY")
+                } finally {
+                    entities.forEach { it.remove() }
+                }
             },
         )
     }

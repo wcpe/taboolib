@@ -155,7 +155,7 @@ class PathfinderExecutorImpl17 : PathfinderExecutor() {
                     collection.remove(it)
                 }
             }
-            if (a.javaClass.simpleName == "PathfinderCreatorImpl17" && a.getProperty<Any>("simpleAI")!!.javaClass.name.contains(name)) {
+            if (a.javaClass.simpleName == "PathfinderCreatorImpl17" && (a as PathfinderCreator).simpleAi.javaClass.name.contains(name)) {
                 if (collection is MutableList) {
                     collection.remove(it)
                 } else if (collection is MutableSet) {
@@ -198,12 +198,24 @@ class PathfinderExecutorImpl17 : PathfinderExecutor() {
         return get<Collection<*>>((getEntityInsentient(entity) as EntityInsentient).targetSelector, pathfinderGoalSelectorSet)
     }
 
+    private fun replaceGoals(selector: PathfinderGoalSelector, ai: Iterable<*>?) {
+        val goals = ai?.map { wrappedGoal ->
+            requireNotNull(wrappedGoal) { "AI collection cannot contain null values" }
+            wrappedGoal.getProperty<Int>("priority", remap = true)!! to wrappedGoal.getProperty<PathfinderGoal>("goal", remap = true)!!
+        }.orEmpty()
+        // 保留选择器内部集合的具体类型与引用，只通过公开行为重建目标集合。
+        val availableGoals = getGoal(selector)
+        require(availableGoals is MutableCollection<*>) { "AI selector goals must be mutable" }
+        availableGoals.clear()
+        goals.forEach { (priority, goal) -> selector.addGoal(priority, goal) }
+    }
+
     override fun setGoalAi(entity: LivingEntity, ai: Iterable<*>?) {
-        put((getEntityInsentient(entity) as EntityInsentient).goalSelector, pathfinderGoalSelectorSet, ai)
+        replaceGoals((getEntityInsentient(entity) as EntityInsentient).goalSelector, ai)
     }
 
     override fun setTargetAi(entity: LivingEntity, ai: Iterable<*>?) {
-        put((getEntityInsentient(entity) as EntityInsentient).targetSelector, pathfinderGoalSelectorSet, ai)
+        replaceGoals((getEntityInsentient(entity) as EntityInsentient).targetSelector, ai)
     }
 
     override fun navigationMove(entity: LivingEntity, location: Location): Boolean {

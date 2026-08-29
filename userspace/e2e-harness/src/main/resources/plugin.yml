@@ -1,0 +1,6 @@
+name: TabooLibE2E
+version: 1.0.0
+main: taboolib.platform.BukkitPlugin
+api-version: '1.13'
+author: sky
+description: TabooLib E2E Version Test Harness

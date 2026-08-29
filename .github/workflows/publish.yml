@@ -19,13 +19,13 @@ jobs:
       contents: read
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # 仅需 HEAD 即可生成 6.3.0-<短哈希> 版本号
           fetch-depth: 1
 
-      - name: 配置 JDK 8
-        uses: actions/setup-java@v4
+      - name: 配置 JDK 21
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           # 仓库编译依赖 1.21.x NMS（v61）与 Hytale 平台（hytale-server v65=Java 21），
@@ -55,7 +55,7 @@ jobs:
       contents: write
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # 归纳变更日志需要完整历史与 tag，才能对比上一发布
           fetch-depth: 0

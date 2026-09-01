@@ -1,6 +1,8 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
+val reflexVersion: String by project
+
 plugins {
     `maven-publish`
     java
@@ -44,8 +46,8 @@ subprojects {
         compileOnly("com.google.guava:guava:21.0")
         compileOnly("com.google.code.gson:gson:2.8.7")
         compileOnly("org.apache.commons:commons-lang3:3.5")
-        compileOnly("org.tabooproject.reflex:reflex:1.2.6-c62cfeb")
-        compileOnly("org.tabooproject.reflex:analyser:1.2.6-c62cfeb")
+        compileOnly("org.tabooproject.reflex:reflex:$reflexVersion")
+        compileOnly("org.tabooproject.reflex:analyser:$reflexVersion")
 
         // 测试依赖
         testImplementation(kotlin("stdlib"))
@@ -53,8 +55,8 @@ subprojects {
         testImplementation("com.google.guava:guava:21.0")
         testImplementation("com.google.code.gson:gson:2.8.7")
         testImplementation("org.apache.commons:commons-lang3:3.5")
-        testImplementation("org.tabooproject.reflex:reflex:1.2.6-c62cfeb")
-        testImplementation("org.tabooproject.reflex:analyser:1.2.6-c62cfeb")
+        testImplementation("org.tabooproject.reflex:reflex:$reflexVersion")
+        testImplementation("org.tabooproject.reflex:analyser:$reflexVersion")
         testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.8.1")
         testImplementation("org.junit.jupiter:junit-jupiter-api:5.8.1")
     }
@@ -150,9 +152,12 @@ fun PublishingExtension.applyToSub(subProject: Project) {
             // 组
             groupId = "io.izzel.taboolib"
             // 版本号
+            // 注意：不能用 "-dev" 后缀——TabooLib 运行时 IS_DEV_MODE 会因版本以 -dev 结尾
+            // 而强制联网下载 taboolib 模块（无视本地 libraries 缓存），导致 local-dev 版本
+            // 在无网络/远程无此版本时无法加载。改用不带 -dev 的本地唯一版本号。
             version = when {
-                project.hasProperty("devLocal") -> "${project.version}-local-dev"
-                project.hasProperty("dev") -> "${project.version}-dev"
+                project.hasProperty("devLocal") -> "${project.version}-local"
+                project.hasProperty("dev") -> "${project.version}-local"
                 else -> "${project.version}"
             }
             // 构件

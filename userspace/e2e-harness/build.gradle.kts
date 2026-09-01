@@ -1,7 +1,7 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 
 val localMavenRepository = file("${System.getProperty("user.home")}/.m2/repository").toURI().toString().removeSuffix("/")
-val localTabooLibVersion = "${project.version}-local-dev"
+val localTabooLibVersion = "${project.version}-local"
 
 dependencies {
     implementation(project(":common"))
@@ -12,6 +12,16 @@ dependencies {
 }
 
 tasks {
+    withType<ShadowJar> {
+        dependsOn(project(":common").tasks.named("shadowJar"))
+        dependsOn(project(":platform:platform-bukkit").tasks.named("shadowJar"))
+    }
+
+    test {
+        dependsOn(project(":common").tasks.named("shadowJar"))
+        dependsOn(project(":platform:platform-bukkit").tasks.named("shadowJar"))
+    }
+
     processResources {
         inputs.property("localMavenRepository", localMavenRepository)
         inputs.property("localTabooLibVersion", localTabooLibVersion)

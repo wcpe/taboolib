@@ -101,7 +101,7 @@ public class PrimitiveSettings {
     /**
      * Reflex 仓库（一般不会修改）
      */
-    public static final String REPO_REFLEX = RUNTIME_PROPERTIES.getProperty("repo-reflex", getProperty("taboolib.repo.reflex", "https://repo.tabooproject.org/repository/releases"));
+    public static final String REPO_REFLEX = RUNTIME_PROPERTIES.getProperty("repo-reflex", getProperty("taboolib.repo.reflex", "https://maven.wcpe.top/repository/maven-public/"));
 
     /**
      * libs 位置

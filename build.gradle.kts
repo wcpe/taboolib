@@ -1,6 +1,8 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
+val reflexVersion: String by project
+
 plugins {
     `maven-publish`
     java
@@ -8,12 +10,10 @@ plugins {
     id("com.github.johnrengelman.shadow") version "7.1.2" apply false
 }
 
-val commitId = providers.exec {
-    commandLine("git", "rev-parse", "--short=7", "HEAD")
-}.standardOutput.asText.map { it.trim() }.get()
-
+// 版本号直接来自 gradle.properties（Debian 式：上游版本 + wcpe 修订后缀，如 6.3.0-wcpe.1），
+// 不再拼接 git 短哈希；发版时手动递增 gradle.properties 的 version 并打同名 tag。
 allprojects {
-    version = "$version-$commitId"
+    version = rootProject.providers.gradleProperty("version").get()
 }
 
 subprojects {
@@ -29,6 +29,7 @@ subprojects {
         maven("https://maven.aliyun.com/repository/central")
         maven("https://repo.codemc.io/repository/nms/")
         maven("https://repo.tabooproject.org/repository/releases")
+        maven("https://maven.wcpe.top/repository/maven-public")
         mavenLocal()
         mavenCentral()
     }
@@ -39,16 +40,17 @@ subprojects {
         compileOnly("com.google.guava:guava:21.0")
         compileOnly("com.google.code.gson:gson:2.8.7")
         compileOnly("org.apache.commons:commons-lang3:3.5")
-        compileOnly("org.tabooproject.reflex:reflex:1.2.4")
-        compileOnly("org.tabooproject.reflex:analyser:1.2.4")
+        compileOnly("org.tabooproject.reflex:reflex:$reflexVersion")
+        compileOnly("org.tabooproject.reflex:analyser:$reflexVersion")
+
         // 测试依赖
         testImplementation(kotlin("stdlib"))
         testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
         testImplementation("com.google.guava:guava:21.0")
         testImplementation("com.google.code.gson:gson:2.8.7")
         testImplementation("org.apache.commons:commons-lang3:3.5")
-        testImplementation("org.tabooproject.reflex:reflex:1.2.4")
-        testImplementation("org.tabooproject.reflex:analyser:1.2.4")
+        testImplementation("org.tabooproject.reflex:reflex:$reflexVersion")
+        testImplementation("org.tabooproject.reflex:analyser:$reflexVersion")
         testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.8.1")
         testImplementation("org.junit.jupiter:junit-jupiter-api:5.8.1")
     }
@@ -116,10 +118,10 @@ subprojects
 
 fun PublishingExtension.applyToSub(subProject: Project) {
     repositories {
-        maven("https://repo.tabooproject.org/repository/releases") {
+        maven("https://maven.wcpe.top/repository/maven-tabooproject-release/") {
             credentials {
-                username = project.findProperty("taboolibUsername").toString()
-                password = project.findProperty("taboolibPassword").toString()
+                username = project.findProperty("wcpeUsername").toString()
+                password = project.findProperty("wcpePassword").toString()
             }
             authentication {
                 create<BasicAuthentication>("basic")
@@ -144,9 +146,12 @@ fun PublishingExtension.applyToSub(subProject: Project) {
             // 组
             groupId = "io.izzel.taboolib"
             // 版本号
+            // 注意：不能用 "-dev" 后缀——TabooLib 运行时 IS_DEV_MODE 会因版本以 -dev 结尾
+            // 而强制联网下载 taboolib 模块（无视本地 libraries 缓存），导致 local-dev 版本
+            // 在无网络/远程无此版本时无法加载。改用不带 -dev 的本地唯一版本号。
             version = when {
-                project.hasProperty("devLocal") -> "${project.version}-local-dev"
-                project.hasProperty("dev") -> "${project.version}-dev"
+                project.hasProperty("devLocal") -> "${project.version}-local"
+                project.hasProperty("dev") -> "${project.version}-local"
                 else -> "${project.version}"
             }
             // 构件

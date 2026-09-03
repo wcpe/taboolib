@@ -6,6 +6,7 @@ import taboolib.common.TabooLib;
 import taboolib.common.classloader.IsolatedClassLoader;
 import taboolib.common.platform.Platform;
 import taboolib.common.platform.PlatformSide;
+import taboolib.common.platform.PluginLifecycle;
 
 import java.io.File;
 
@@ -57,7 +58,7 @@ public class App {
      * 结束
      */
     public static void shutdown() {
-        TabooLib.lifeCycle(LifeCycle.DISABLE);
+        PluginLifecycle.disable();
     }
 
     /**

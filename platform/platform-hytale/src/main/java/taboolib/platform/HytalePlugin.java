@@ -13,6 +13,7 @@ import taboolib.common.classloader.IsolatedClassLoader;
 import taboolib.common.platform.Platform;
 import taboolib.common.platform.PlatformSide;
 import taboolib.common.platform.Plugin;
+import taboolib.common.platform.PluginLifecycle;
 
 import java.io.File;
 import java.nio.file.Path;
@@ -119,12 +120,7 @@ public class HytalePlugin extends JavaPlugin {
 
     @Override
     protected void shutdown() {
-        // 在插件未关闭的前提下，执行 onDisable() 方法
-        if (pluginInstance != null && !TabooLib.isStopped()) {
-            pluginInstance.onDisable();
-        }
-        // 生命周期任务
-        TabooLib.lifeCycle(LifeCycle.DISABLE);
+        PluginLifecycle.disable(pluginInstance);
     }
 
     /**

@@ -8,6 +8,7 @@ import org.objectweb.asm.commons.AdviceAdapter
 import org.objectweb.asm.tree.ClassNode
 import org.objectweb.asm.tree.LdcInsnNode
 import org.objectweb.asm.tree.MethodInsnNode
+import taboolib.module.incision.api.Anchor
 import taboolib.module.incision.api.MethodCoordinate
 import taboolib.module.incision.cache.IncisionCache
 import taboolib.module.incision.diagnostic.Forensics
@@ -45,6 +46,12 @@ class Scalpel(
         val sites: List<SiteSpec> = emptyList(),
     )
 
+    private data class ResolvedAdviceTargetSpec(
+        val original: AdviceTargetSpec,
+        val matchTarget: MethodCoordinate,
+        val sites: List<SiteSpec>,
+    )
+
     fun weave(originalBytes: ByteArray): ByteArray {
         return try {
             val probeReader = ClassReader(originalBytes)
@@ -58,23 +65,25 @@ class Scalpel(
             val sourceReader = ClassReader(sourceBytes)
             val owner = sourceReader.className
             val targets = targetsByOwner[owner] ?: return originalBytes
+            val methodSignatures = collectMethodSignatures(sourceReader)
+            val resolvedTargets = targets.map { resolveAdviceTarget(owner, it, methodSignatures) }
             val loader = currentTransformLoader.get()
             // Site 必须先落到逻辑原方法体，再由 SPLICE/EXCISE 提取 body。若先生成入口 dispatcher，
             // proceed() 会调用尚未包含 Site 的旧 body，使 INVOKE/FIELD/NEW advice 永远不可达。
-            val bodySourceBytes = if (targets.any { it.sites.isNotEmpty() }) {
-                applySiteWeaver(sourceBytes, targets, loader)
+            val bodySourceBytes = if (resolvedTargets.any { it.sites.isNotEmpty() }) {
+                applySiteWeaver(sourceBytes, resolvedTargets, loader)
             } else {
                 sourceBytes
             }
             val reader = ClassReader(bodySourceBytes)
             val writer = SafeClassWriter(reader, loader)
-            val existingEntryPhases = detectExistingEntryPhases(bodySourceBytes, targets)
-            val visitor = WeavingClassVisitor(Opcodes.ASM9, writer, targets, existingEntryPhases)
+            val existingEntryPhases = detectExistingEntryPhases(bodySourceBytes, resolvedTargets)
+            val visitor = WeavingClassVisitor(Opcodes.ASM9, writer, resolvedTargets, existingEntryPhases)
             // 只映射声明坐标，绝不能再次映射服务端已经转换过的整份字节码；后者会破坏
             // Paper/CraftBukkit 自带的 relocated 依赖名称，并在 retransform 后污染运行中的类。
             reader.accept(visitor, ClassReader.EXPAND_FRAMES)
             val bytes = writer.toByteArray()
-            generateAndRegisterBodies(owner, bodySourceBytes, targets)
+            generateAndRegisterBodies(owner, bodySourceBytes, resolvedTargets)
             devDumpIfEnabled(owner, sourceBytes, bytes)
             bytes
         } catch (t: Throwable) {
@@ -110,6 +119,118 @@ class Scalpel(
         }
     }
 
+    private fun collectMethodSignatures(reader: ClassReader): Set<Pair<String, String>> {
+        val node = org.objectweb.asm.tree.ClassNode()
+        reader.accept(node, ClassReader.SKIP_CODE or ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES)
+        return node.methods.map { it.name to it.desc }.toSet()
+    }
+
+    private fun resolveAdviceTarget(
+        owner: String,
+        spec: AdviceTargetSpec,
+        methodSignatures: Set<Pair<String, String>>,
+    ): ResolvedAdviceTargetSpec {
+        val matchTarget = resolveMethodTarget(owner, spec.target, methodSignatures)
+        val sites = spec.sites.flatMap { resolveSiteCandidates(it) }.distinct()
+        return ResolvedAdviceTargetSpec(spec, matchTarget, sites)
+    }
+
+    private fun resolveMethodTarget(
+        owner: String,
+        target: MethodCoordinate,
+        methodSignatures: Set<Pair<String, String>>,
+    ): MethodCoordinate {
+        // 原名优先：类中已存在目标原名(名+描述符)时直接用原名
+        if (hasMethod(methodSignatures, target.name, target.descriptor)) {
+            return target.copy(owner = owner)
+        }
+        // 原名不存在 → 走前向 resolver：方法名解析为运行期名，描述符里的类型也逐个由 Mojang 映射到运行期。
+        // resolver.resolveMethod 只映射方法名、描述符原样返回，故描述符必须自己 remap；否则混淆环境下
+        // matchTarget.descriptor 仍是 Mojang 形态，visitor / site / body 三条匹配路都会按描述符漏命中。
+        val resolvedName = resolver.resolveMethod(owner, target.name, target.descriptor).first
+        val resolvedDesc = remapDescriptorTypes(target.descriptor)
+        return MethodCoordinate(owner, resolvedName, resolvedDesc)
+    }
+
+    /** 把方法描述符里的每个 `L...;` 类型用前向 resolver 由 Mojang 映射到运行期名；基元/数组前缀原样保留。 */
+    private fun remapDescriptorTypes(descriptor: String): String {
+        val open = descriptor.indexOf('(')
+        val close = descriptor.indexOf(')')
+        if (open < 0 || close < 0 || close < open) return descriptor
+        val args = descriptor.substring(open + 1, close)
+        val ret = descriptor.substring(close + 1)
+        return "(" + remapTypeSeq(args) + ")" + remapTypeSeq(ret)
+    }
+
+    /** 处理一段连续的 JVM 类型描述符（参数序列或单个返回类型），逐类型 remap 引用类型。 */
+    private fun remapTypeSeq(seq: String): String {
+        if (seq.isEmpty() || seq == "*") return seq
+        val sb = StringBuilder(seq.length)
+        var i = 0
+        while (i < seq.length) {
+            val c = seq[i]
+            if (c == '[') { sb.append(c); i++; continue }
+            if (c == 'L') {
+                val semi = seq.indexOf(';', i)
+                if (semi < 0) { sb.append(seq.substring(i)); break }
+                val internal = seq.substring(i + 1, semi)
+                sb.append('L').append(resolver.resolveOwner(internal)).append(';')
+                i = semi + 1
+            } else {
+                // 基元类型（V/Z/B/S/I/J/F/D/C）原样
+                sb.append(c); i++
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun hasMethod(methodSignatures: Set<Pair<String, String>>, name: String, descriptor: String): Boolean {
+        return methodSignatures.any { (actualName, actualDesc) ->
+            actualName == name && matchesDesc(descriptor, actualDesc)
+        }
+    }
+
+    private fun resolveSiteCandidates(site: SiteSpec): List<SiteSpec> {
+        val remapped = when (site.anchor) {
+            Anchor.INVOKE -> resolveInvokeSite(site)
+            Anchor.FIELD_GET, Anchor.FIELD_PUT -> resolveFieldSite(site)
+            Anchor.NEW -> resolveNewSite(site)
+            else -> site
+        }
+        return listOf(site, remapped).distinct()
+    }
+
+    private fun resolveInvokeSite(site: SiteSpec): SiteSpec {
+        if (site.ownerPattern.isEmpty()) return site
+        val resolvedOwner = resolver.resolveOwner(site.ownerPattern)
+        var resolvedName = site.namePattern
+        var resolvedDesc = site.descPattern
+        if (site.namePattern.isNotEmpty()) {
+            val mapped = resolver.resolveMethod(site.ownerPattern, site.namePattern, site.descPattern)
+            resolvedName = mapped.first
+            resolvedDesc = mapped.second
+        }
+        return site.copy(ownerPattern = resolvedOwner, namePattern = resolvedName, descPattern = resolvedDesc)
+    }
+
+    private fun resolveFieldSite(site: SiteSpec): SiteSpec {
+        if (site.ownerPattern.isEmpty()) return site
+        val resolvedOwner = resolver.resolveOwner(site.ownerPattern)
+        var resolvedName = site.namePattern
+        var resolvedDesc = site.descPattern
+        if (site.namePattern.isNotEmpty()) {
+            val mapped = resolver.resolveField(site.ownerPattern, site.namePattern, site.descPattern)
+            resolvedName = mapped.first
+            resolvedDesc = mapped.second
+        }
+        return site.copy(ownerPattern = resolvedOwner, namePattern = resolvedName, descPattern = resolvedDesc)
+    }
+
+    private fun resolveNewSite(site: SiteSpec): SiteSpec {
+        if (site.ownerPattern.isEmpty()) return site
+        return site.copy(ownerPattern = resolver.resolveOwner(site.ownerPattern))
+    }
+
     private fun devDumpIfEnabled(owner: String, before: ByteArray, after: ByteArray) {
         if (System.getProperty("incision.dev", "false").toBoolean().not()) return
         val dir = File(System.getProperty("incision.devDir", ".dev/incision"))
@@ -128,7 +249,7 @@ class Scalpel(
      *
      * 回退策略：Forensics.warn 记录失败方法与原因，返回 `bytes` 不动。保守避免把坏 class 喂给 JVM 触发 VerifyError。
      */
-    private fun applySiteWeaver(bytes: ByteArray, targets: List<AdviceTargetSpec>, loader: ClassLoader?): ByteArray {
+    private fun applySiteWeaver(bytes: ByteArray, targets: List<ResolvedAdviceTargetSpec>, loader: ClassLoader?): ByteArray {
         val reader = ClassReader(bytes)
         val original = org.objectweb.asm.tree.ClassNode()
         reader.accept(original, ClassReader.EXPAND_FRAMES)
@@ -157,7 +278,7 @@ class Scalpel(
 
         for (method in original.methods) {
             val sites = targets
-                .filter { it.target.name == method.name && matchesDesc(it.target.descriptor, method.desc) }
+                .filter { it.matchTarget.name == method.name && matchesDesc(it.matchTarget.descriptor, method.desc) }
                 .flatMap { it.sites }
             if (sites.isNullOrEmpty()) {
                 weaved.methods.add(method)
@@ -245,13 +366,16 @@ class Scalpel(
     private fun generateAndRegisterBodies(
         owner: String,
         originalBytes: ByteArray,
-        targets: List<AdviceTargetSpec>,
+        targets: List<ResolvedAdviceTargetSpec>,
     ) {
-        val spliceMethods: Set<Pair<String, String>> = targets
-            .filter { it.kinds.any { k -> k in bodyKinds } }
-            .map { it.target.name to it.target.descriptor }
+        val bodyTargets = targets.filter { it.original.kinds.any { k -> k in bodyKinds } }
+        val spliceMethods: Set<Pair<String, String>> = bodyTargets
+            .map { it.matchTarget.name to it.matchTarget.descriptor }
             .toSet()
         if (spliceMethods.isEmpty()) return
+        val bodyMethodNames = bodyTargets.associate {
+            (it.matchTarget.name to it.matchTarget.descriptor) to (it.original.target.name + BodiesClassGenerator.BODY_METHOD_SUFFIX)
+        }
         val bodiesName = BridgeClassLoader.bodiesClassName(owner)
         val targetLoader = currentTransformLoader.get()
         if (targetLoader != null && isClassDefined(bodiesName, targetLoader)) return
@@ -260,7 +384,7 @@ class Scalpel(
         // original cache 取回未织入版本，否则 Splice.proceed() 会跳过同一方法上的 Site。
         val sourceBytes = originalBytes
         val bodiesBytes = try {
-            BodiesClassGenerator.generate(sourceBytes, owner, spliceMethods)
+            BodiesClassGenerator.generate(sourceBytes, owner, spliceMethods, bodyMethodNames)
         } catch (t: Throwable) {
             Forensics.error("BodiesClassGenerator.generate failed: $owner — ${t.message}", t)
             null
@@ -318,7 +442,7 @@ class Scalpel(
         return false
     }
 
-    /** 方法键必须包含 descriptor，同名重载之间不能共享“已织入”判断。 */
+    /** 方法键必须包含 descriptor，同名重载之间不能共享"已织入"判断。 */
     private data class MethodKey(val name: String, val descriptor: String)
 
     /**
@@ -332,20 +456,22 @@ class Scalpel(
      *
      * Instrumentation 会把多个可重转换 transformer 串联执行，后一个插件拿到的 bytes 已包含
      * 前一个插件的输出。若再次发射相同 phase，单次方法调用会产生 N 个 Bridge 入口，而每个入口
-     * 又广播给 N 个插件，最终放大为 N² 次。这里按“重载方法 + 完整目标签名 + phase”识别，
+     * 又广播给 N 个插件，最终放大为 N² 次。这里按"重载方法 + 完整目标签名 + phase"识别，
      * 不会把同一方法里的其他 Site 调度或其他目标误判为重复入口。
      */
     private fun detectExistingEntryPhases(
         bytes: ByteArray,
-        targets: List<AdviceTargetSpec>,
+        targets: List<ResolvedAdviceTargetSpec>,
     ): Map<MethodKey, Set<EntryPhase>> {
         val node = ClassNode(Opcodes.ASM9)
         ClassReader(bytes).accept(node, ClassReader.SKIP_DEBUG)
         val result = mutableMapOf<MethodKey, MutableSet<EntryPhase>>()
         for (method in node.methods) {
+            // matchTarget 是运行期名+描述符，用于匹配字节码中的方法；
+            // original.target.signature 是用户声明签名，用于和 emittedSignature 匹配（dispatch key 用原始签名）
             val signatures = targets.asSequence()
-                .filter { it.target.name == method.name && matchesEntryDescriptor(it.target.descriptor, method.desc) }
-                .map { it.target.signature }
+                .filter { it.matchTarget.name == method.name && matchesEntryDescriptor(it.matchTarget.descriptor, method.desc) }
+                .map { it.original.target.signature }
                 .toSet()
             if (signatures.isEmpty()) continue
             for (instruction in method.instructions) {
@@ -404,7 +530,7 @@ class Scalpel(
 
     private class WeavingClassVisitor(
         api: Int, cv: ClassWriter,
-        val targets: List<AdviceTargetSpec>,
+        val targets: List<ResolvedAdviceTargetSpec>,
         val existingEntryPhases: Map<MethodKey, Set<EntryPhase>>,
     ) : org.objectweb.asm.ClassVisitor(api, cv) {
 
@@ -416,11 +542,13 @@ class Scalpel(
 
         override fun visitMethod(access: Int, name: String, descriptor: String, signature: String?, exceptions: Array<out String>?): MethodVisitor {
             val base = super.visitMethod(access, name, descriptor, signature, exceptions)
-            val matching = targets.filter { matchesDescriptor(it.target.descriptor, descriptor) && it.target.name == name }
+            // matchTarget 已是「运行期名 + 运行期描述符」（resolveMethodTarget 负责原名优先与描述符 remap），
+            // 故 visitor / site / body 三条路共用同一套匹配口径
+            val matching = targets.filter { it.matchTarget.name == name && matchesDescriptor(it.matchTarget.descriptor, descriptor) }
             if (matching.isEmpty()) return base
             val mergedKinds = mutableSetOf<AdviceKind>()
-            for (s in matching) mergedKinds.addAll(s.kinds)
-            val mergedSpec = AdviceTargetSpec(matching.first().target, mergedKinds, matching.flatMap { it.sites })
+            for (s in matching) mergedKinds.addAll(s.original.kinds)
+            val mergedSpec = AdviceTargetSpec(matching.first().original.target, mergedKinds, matching.flatMap { it.original.sites })
             Forensics.debug("weave inject $className.$name$descriptor kinds=$mergedKinds static=${(access and Opcodes.ACC_STATIC) != 0}")
             return AdviceInjector(
                 api,

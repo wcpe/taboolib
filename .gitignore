@@ -16,3 +16,11 @@ scripts/e2e/bot/node_modules/
 scripts/e2e/__pycache__/
 e2e-done.marker
 .opencode/tmp
+/.tmp/
+
+# Incision native：运行期只提取 .dll/.so/.dylib，调试符号与链接期产物不参与发布
+module/incision/src/main/resources/native/**/*.pdb
+module/incision/src/main/resources/native/**/*.lib
+
+# Incision 性能测试的原始控制台日志体积过大，只保留 raw/ 的 json 与 data/ 的汇总
+module/incision/performance/**/console/*.log

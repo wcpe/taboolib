@@ -235,8 +235,9 @@ InstrumentationBackend 依赖 self-attach，而 self-attach 在真实服务端�
 ```
 module/incision/src/main/c/
   ├─ incision_jvmti.c                ← 手写 C 源码
-  ├─ build-all.bat                   ← 交叉编译脚本
-  └─ include/                        ← JNI 头文件
+  ├─ build-native.sh                 ← 交叉编译脚本（Linux / macOS）
+  ├─ build-native.bat                ← 交叉编译脚本（Windows）
+  └─ include/                        ← JNI 头文件（darwin / linux / windows）
 
 module/incision/src/main/resources/native/
   ├─ windows/x64/incision-jvmti.dll

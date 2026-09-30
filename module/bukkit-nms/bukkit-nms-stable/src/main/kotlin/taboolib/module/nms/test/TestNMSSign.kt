@@ -57,23 +57,59 @@ object TestNMSSign : Test() {
                 // 服务端启动时已提前初始化映射，这里把恢复结果注入同一委托以重演新版首次读取后的运行状态。
                 val mapping = Mapping.exchange(paperId)
                 valueField.set(delegate, mapping)
-                check(mapping.classMapSpigotToMojang["net.minecraft.core.BlockPosition"] == "net.minecraft.core.BlockPos")
-                check(mapping.classMapSpigotS2F["BlockPosition"] == "net.minecraft.core.BlockPosition")
+                // 26.1 起 Minecraft 不再混淆，Spigot → Mojang 的映射机制不适用，跳过恢复结果断言。
+                if (!MinecraftVersion.isUnobfuscated) {
+                    check(mapping.classMapSpigotToMojang["net.minecraft.core.BlockPosition"] == "net.minecraft.core.BlockPos")
+                    check(mapping.classMapSpigotS2F["BlockPosition"] == "net.minecraft.core.BlockPosition")
+                }
 
                 val implementation = nmsProxy<NMSSign>()
                 check(implementation.javaClass.simpleName == "NMSSignImpl")
-                val constructor = implementation.javaClass.getMethod("getConstructorPacketOutSignEditor").invoke(implementation) as Constructor<*>
-                check(constructor.parameterTypes.contentEquals(arrayOf(Class.forName("net.minecraft.core.BlockPos"), java.lang.Boolean.TYPE)))
+                // 构造器签名按版本而变：1.20 起带「是否正面」布尔形参，更早版本只有坐标单参
+                // （与 NMSSignImpl.openSignEditor 的分流同源）。此处必须跟着分流，否则 1.20 以下必然抛 NoSuchMethodException。
+                if (MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_20)) {
+                    // 1.20 起才有带「是否正面」布尔形参的构造器。更早版本只有坐标单参，且类名随版本而变
+                    // （1.17+ 位于 network.protocol.game，更早为 net.minecraft.server.v<版本>），
+                    // 故旧区间不做构造器断言——该区间的转译正确性由下方 remap 产物断言覆盖。
+                    val constructor = implementation.javaClass.getMethod("getConstructorPacketOutSignEditor").invoke(implementation) as Constructor<*>
+                    // 经实现类 ClassLoader 解析 NMS 类型，避免 IsolatedClassLoader 下 Class.forName 找不到；
+                    // 1.20 - 1.20.4 的服务端仍是 Spigot 映射，类名为 BlockPosition
+                    val blockPosClass = runCatching {
+                        Class.forName("net.minecraft.core.BlockPos", false, implementation.javaClass.classLoader)
+                    }.getOrElse {
+                        Class.forName("net.minecraft.core.BlockPosition", false, implementation.javaClass.classLoader)
+                    }
+                    check(constructor.parameterTypes.contentEquals(arrayOf(blockPosClass, java.lang.Boolean.TYPE)))
+                }
 
                 val remapDirectory = BinaryCache.getCacheFile().resolve("binary/remap")
                 val generatedClasses = remapDirectory.listFiles()
-                    ?.filter { it.name.startsWith("taboolib.module.nms.NMSSignImpl") }
+                    ?.filter { file -> file.name.startsWith("taboolib.module.nms.NMSSignImpl") }
                     ?: emptyList()
                 check(generatedClasses.isNotEmpty())
-                val staleReference = generatedClasses.firstOrNull { file ->
-                    val bytecode = file.readBytes().toString(Charsets.ISO_8859_1)
-                    bytecode.contains("net/minecraft/server/v1_12_R1/BlockPosition") ||
-                        bytecode.contains("net/minecraft/server/v1_16_R1/BlockPosition")
+                // 运行期方块坐标类的内部名：1.17 起为 net/minecraft/core/BlockPosition，更早是版本化包
+                // net/minecraft/server/v<CraftBukkit 版本>/BlockPosition——后者本身就是正确名字，
+                // 不能一律把版本化引用判为「陈旧」（1.12.2 / 1.16.5 等旧版本会误报）。
+                val craftBukkitVersion = Bukkit.getServer().javaClass.name
+                    .substringAfter("craftbukkit.", "")
+                    .substringBefore('.')
+                val runtimeBlockPosition = "net/minecraft/server/$craftBukkitVersion/BlockPosition"
+                val legacyAliases = listOf(
+                    "net/minecraft/server/v1_12_R1/BlockPosition",
+                    "net/minecraft/server/v1_16_R1/BlockPosition",
+                )
+                val staleReference = generatedClasses
+                    // 1.20 起才会访问 constructorPacketOutSignEditor，其 lazy 内部类在更早版本是死代码——
+                    // remap 不为「当前版本不存在的类」生成映射，故旧版本只检查主类，避免误报。
+                    .filter { file ->
+                        MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_20) || !file.name.contains('$')
+                    }
+                    .firstOrNull { file ->
+                        val bytecode = file.readBytes().toString(Charsets.ISO_8859_1)
+                        legacyAliases.any { alias -> alias != runtimeBlockPosition && bytecode.contains(alias) }
+                    }
+                check(staleReference == null) {
+                    "生成的 NMSSignImpl 字节码仍包含旧 BlockPosition 引用: ${staleReference?.name}"
                 }
                 check(staleReference == null) {
                     "生成的 NMSSignImpl 字节码仍包含旧 BlockPosition 引用: ${staleReference?.name}"

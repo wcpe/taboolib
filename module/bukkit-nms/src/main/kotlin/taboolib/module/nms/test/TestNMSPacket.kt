@@ -27,20 +27,48 @@ object TestNMSPacket : Test() {
     var testReceive = false
     var testReceiveHandshake = false
 
+    /** 监听器是否已注册（防止重复注册）。 */
+    private var listenersReady = false
+
     @Awake(LifeCycle.LOAD)
     fun setup() {
-        if (isDevelopmentMode) {
-            InternalEventBus.listen(PacketSendEvent::class.java) { testSend = true }
-            InternalEventBus.listen(PacketSendEvent.Handshake::class.java) { testSendHandshake = true }
-            InternalEventBus.listen(PacketReceiveEvent::class.java) { testReceive = true }
-            InternalEventBus.listen(PacketReceiveEvent.Handshake::class.java) { testReceiveHandshake = true }
+        // 握手类包事件只在玩家连接时刻触发，晚于测试执行点，故必须在 LOAD 期注册；
+        // 生产环境不注册，以免触发无谓的 Channel 注入。
+        // 注册条件：开发模式，或 mc-testkit 端到端环境（其结果文件环境变量为既定契约，
+        // 端到端以 `-local` 版本运行，非开发模式）。
+        if (isDevelopmentMode || isEndToEndRun()) {
+            registerListeners()
         }
+    }
+
+    /** 是否运行在 mc-testkit 端到端环境。 */
+    private fun isEndToEndRun(): Boolean = System.getenv("MC_TESTKIT_E2E_RESULT_FILE") != null
+
+    /**
+     * 注册包事件监听。
+     *
+     * 包事件的触发以「存在监听者」为前提（[ProtocolHandler] 的 Channel 注入按此懒加载），
+     * 故这些断言必须先注册监听。开发模式在 LOAD 期注册；端到端测试以 `-local` 版本运行
+     * （非 `-dev`，[isDevelopmentMode] 为 false），改在 [check] 执行点补注册——
+     * 否则包事件三项在任何非开发环境下都必然 NOT_TRIGGERED。
+     */
+    private fun registerListeners() {
+        if (listenersReady) {
+            return
+        }
+        listenersReady = true
+        InternalEventBus.listen(PacketSendEvent::class.java) { testSend = true }
+        InternalEventBus.listen(PacketSendEvent.Handshake::class.java) { testSendHandshake = true }
+        InternalEventBus.listen(PacketReceiveEvent::class.java) { testReceive = true }
+        InternalEventBus.listen(PacketReceiveEvent.Handshake::class.java) { testReceiveHandshake = true }
     }
 
     override fun check(): List<Result> {
         val result = arrayListOf<Result>()
         val player = Bukkit.getOnlinePlayers().firstOrNull()
         if (player != null) {
+            // 非开发模式（含端到端测试的 -local 版本）在 setup 期不注册，此处补注册
+            registerListeners()
             // 测试连接
             result += sandbox("NMS:getConnection(Player)") { PacketSender.getConnection(player) }
             // 测试发包
@@ -84,6 +112,16 @@ object TestNMSPacket : Test() {
                 check(PacketImpl(Runnable {}).isUnmappedSyntheticClass())
             }
             result += sandbox("NMS:ProtocolHandler.isInjected") { check(ProtocolHandler.isInjected()) }
+            // 发送类事件由 sendPacket* 同步触发；接收类事件依赖客户端回包（bot 会自动回应 KeepAlive），
+            // 需给网络往返留出时间，否则真实网络下会误判为 NOT_TRIGGERED（最多等待 1 秒）
+            if (!testReceive) {
+                for (i in 0 until 20) {
+                    if (testReceive) {
+                        break
+                    }
+                    Thread.sleep(50)
+                }
+            }
             // 测试事件
             result += if (testSend) Success.of("NMS:PacketSendEvent") else Failure.of("NMS:PacketSendEvent", "NOT_TRIGGERED")
             result += if (testSendHandshake) Success.of("NMS:PacketSendEvent.Handshake") else Failure.of("NMS:PacketSendEvent.Handshake", "NOT_TRIGGERED")

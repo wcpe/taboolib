@@ -1,4 +1,16 @@
 rootProject.name = "TabooLib"
+
+pluginManagement {
+    repositories {
+        mavenLocal()
+        maven("https://maven.aliyun.com/repository/gradle-plugin")
+        maven("https://maven.aliyun.com/repository/public")
+        maven("https://repo.wcpe.top/repository/maven-public/")
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
 include("common", "common-env", "common-util", "common-legacy-api", "common-reflex", "common-platform-api")
 include(
     // 基础工具

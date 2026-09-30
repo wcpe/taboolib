@@ -28,7 +28,7 @@ class PluginLifecycleTest {
         })
 
         assertTrue(disabled)
-        assertEquals(0, ReflexClass.reflexClassCacheMap.size)
+        assertEquals(0, ReflexClass.reflexClassCacheMap.size())
     }
 
     @Test
@@ -45,11 +45,11 @@ class PluginLifecycleTest {
         }
 
         assertSame(failure, actual)
-        assertEquals(0, ReflexClass.reflexClassCacheMap.size)
+        assertEquals(0, ReflexClass.reflexClassCacheMap.size())
     }
 
     private fun cacheTestClass() {
         ReflexClass.of(PluginLifecycleTest::class.java)
-        assertTrue(ReflexClass.reflexClassCacheMap.size > 0)
+        assertTrue(ReflexClass.reflexClassCacheMap.size() > 0)
     }
 }

@@ -8,6 +8,7 @@ plugins {
     java
     id("org.jetbrains.kotlin.jvm") version "1.8.22" apply false
     id("com.github.johnrengelman.shadow") version "7.1.2" apply false
+    id("top.wcpe.mc-testkit") version "0.15.0" apply false
 }
 
 // 版本号直接来自 gradle.properties（Debian 式：上游版本 + wcpe 修订后缀，如 6.3.0-wcpe.1），

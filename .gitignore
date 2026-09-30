@@ -12,8 +12,7 @@ nul
 /libraries/
 /logs/
 /versions/
-scripts/e2e/bot/node_modules/
-scripts/e2e/__pycache__/
+userspace/e2e-harness/e2e-bot/node_modules/
 e2e-done.marker
 .opencode/tmp
 /.tmp/

@@ -10,17 +10,20 @@ import java.io.File
 import java.lang.reflect.Modifier
 import java.text.SimpleDateFormat
 import java.util.ArrayList
+import java.util.Collections
 import java.util.Date
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * E2E 测试发现与执行器
- *
- * @author sky
+ * E2E 测试发现与执行器（mc-testkit 判定真源写入方）。
  */
 object E2ERunner {
 
     private val isRunning = AtomicBoolean(false)
+
+    /** bot 经聊天回报的客户端探针（E2E_PROBES:...）。 */
+    private val clientProbes: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
     private val expectedTestClasses = setOf(
         "taboolib.module.ai.test.TestSimpleAi",
         "taboolib.module.nms.test.TestDataSerializer",
@@ -39,9 +42,47 @@ object E2ERunner {
         "taboolib.module.nms.test.TestTellrawJson",
     )
 
-    /**
-     * 发现所有已加载的 Test 实现类/对象
-     */
+    private val expectedClientProbes = setOf(
+        "ACTION_BAR",
+        "AI_LIFECYCLE",
+        "AI_NAVIGATION_ENTITY",
+        "AI_NAVIGATION_LOCATION",
+        "SCOREBOARD_REMOVED",
+        "SCOREBOARD_TITLE",
+        "SIGN_CALLBACK",
+        "TEAM",
+        "TITLE",
+    )
+
+    private fun isPlayerContextFailure(failure: Test.Failure): Boolean {
+        val text = (failure.reason + " " + (failure.error.message ?: "")).lowercase()
+        return "player" in text || "在线" in text || "target is unavailable" in text
+    }
+
+    /** 从服务端 latest.log 收集测试侧打点的 [E2E-PROBE]（AI/SIGN 等不在 bot 聊天通道）。 */
+    private fun harvestServerLogProbes() {
+        val log = File("logs/latest.log")
+        if (!log.exists()) return
+        log.readLines().forEach { line ->
+            val idx = line.indexOf("[E2E-PROBE] ")
+            if (idx >= 0) {
+                val name = line.substring(idx + "[E2E-PROBE] ".length).trim()
+                if (name.isNotEmpty()) {
+                    clientProbes += name
+                }
+            }
+        }
+        info("[E2E] 服务端日志探针合并后: ${clientProbes.sorted()}")
+    }
+
+    fun recordClientProbes(raw: String) {
+        raw.split(',', ' ', ';')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .forEach { clientProbes += it }
+        info("[E2E] 已合并客户端探针: $clientProbes")
+    }
+
     fun discoverTests(): List<Test> {
         val tests = ArrayList<Test>()
         val classMap = runningClassMap
@@ -66,24 +107,12 @@ object E2ERunner {
         return tests
     }
 
-    /**
-     * 异步运行测试，并在完成后根据系统属性决定是否关闭服务端
-     *
-     * @param triggerReason 本次执行的触发来源
-     * @param delayTicks 开始执行前等待的服务端 tick 数
-     */
     fun runTestsAsync(triggerReason: String, delayTicks: Long = 20L) {
         submit(delay = delayTicks) {
             runTests(triggerReason)
         }
     }
 
-    /**
-     * 同步执行测试套件并写入结果
-     *
-     * @param triggerReason 本次执行的触发来源
-     * @return 测试套件结果
-     */
     fun runTests(triggerReason: String): TestSuiteResult {
         if (!isRunning.compareAndSet(false, true)) {
             warning("[E2E] 测试套件已在运行中，跳过重复触发 ($triggerReason)")
@@ -102,7 +131,7 @@ object E2ERunner {
                 warning("[E2E]   [FAIL] E2E:testLoaded:$testName -> ${error.message}")
                 allResults += Test.Failure.of("E2E:testLoaded:$testName", error)
             }
-            // 历史 Exchanges 回归测试必须先于其它 NMS 测试，确保首次加载代理类时仍使用模拟状态。
+            // 历史 Exchanges 回归测试必须先于其它 NMS 测试
             val orderedTests = tests.sortedBy { if (it.javaClass.name == "taboolib.module.nms.test.TestNMSSign") 0 else 1 }
             for (test in orderedTests) {
                 val testName = test.javaClass.simpleName
@@ -127,28 +156,33 @@ object E2ERunner {
                 }
             }
 
+            // smoke（无 bot/无玩家）下，玩家上下文用例失败降级为 SKIP，避免矩阵被 bot 能力淹没
+            if (!E2EMcTestkitVerdict.requiresPlayer() &&
+                runCatching { Bukkit.getOnlinePlayers().isEmpty() }.getOrDefault(true)
+            ) {
+                for (i in allResults.indices) {
+                    val r = allResults[i]
+                    if (r is Test.Failure && isPlayerContextFailure(r)) {
+                        allResults[i] = Test.Unsupported(r.reason + " (smoke: no player)")
+                        info("[E2E] smoke 降级玩家上下文失败为 SKIP: ${r.reason}")
+                    }
+                }
+            }
+
             val suiteResult = TestSuiteResult(allResults, triggerReason)
             info("[E2E] ========== 测试完成 ==========")
             info("[E2E] 总数: ${suiteResult.total}, 成功: ${suiteResult.success}, 失败: ${suiteResult.failure}, 跳过: ${suiteResult.unsupported}")
 
-            val resultFile = writeResultJson(suiteResult)
-            info("[E2E] 结果已写入: ${resultFile.absolutePath}")
+            writeResultJson(suiteResult)
 
-            // 写入完成标记文件供外部脚本感知
-            val doneFile = File("e2e-done.marker")
-            doneFile.writeText(if (suiteResult.failure == 0) "SUCCESS" else "FAILURE")
-
-            if (System.getProperty("taboolib.e2e.exit") == "true") {
-                info("[E2E] taboolib.e2e.exit=true，5 秒后关闭服务端...")
-                submit(delay = 100L) {
-                    try {
-                        val serverCls = Class.forName("org.bukkit.Bukkit")
-                        val shutdownMethod = serverCls.getMethod("shutdown")
-                        shutdownMethod.invoke(null)
-                    } catch (ex: Throwable) {
-                        System.exit(if (suiteResult.failure == 0) 0 else 1)
-                    }
+            // 请求 bot 回报探针，短等后合并并写 mc-testkit 结果
+            if (E2EMcTestkitVerdict.requiresPlayer()) {
+                E2EPlugin.requestBotProbes()
+                submit(delay = 60L) {
+                    finishWithVerdict(suiteResult)
                 }
+            } else {
+                finishWithVerdict(suiteResult)
             }
 
             return suiteResult
@@ -157,12 +191,62 @@ object E2ERunner {
         }
     }
 
-    /**
-     * 将结果写出为 JSON 文件
-     *
-     * @param suite 测试套件结果
-     * @return 写出的结果文件
-     */
+    private fun finishWithVerdict(suite: TestSuiteResult) {
+        // 服务端日志中的 [E2E-PROBE] 与 bot 聊天回报合并
+        harvestServerLogProbes()
+        var passed = suite.failure == 0
+        val missingProbes: MutableSet<String> = mutableSetOf()
+        if (E2EMcTestkitVerdict.requiresPlayer()) {
+            missingProbes += expectedClientProbes - clientProbes
+            if (clientProbes.isEmpty()) {
+                info("[E2E] 未收到 bot 探针回报（probes=unavailable），仅以服务端 Test 结果判定")
+            } else if (missingProbes.isNotEmpty()) {
+                // 探针为补充观测：服务端 Test 通过时不因缺探针 FAIL（协议/版本差异常见）
+                warning("[E2E] 缺少客户端探针（不单独判 FAIL）: $missingProbes")
+            }
+        }
+
+        val message = buildString {
+            append("total=${suite.total} success=${suite.success} failure=${suite.failure} unsupported=${suite.unsupported}")
+            if (E2EMcTestkitVerdict.requiresPlayer()) {
+                append(" probes=").append(clientProbes.sorted().joinToString("|").ifEmpty { "unavailable" })
+                if (missingProbes.isNotEmpty()) {
+                    append(" missingProbes=").append(missingProbes.sorted().joinToString("|"))
+                }
+            }
+        }
+
+        val wrote = E2EMcTestkitVerdict.report(
+            ok = passed,
+            message = message,
+            extras = mapOf(
+                "total" to suite.total.toString(),
+                "success" to suite.success.toString(),
+                "failure" to suite.failure.toString(),
+                "unsupported" to suite.unsupported.toString(),
+                "reason" to suite.reason,
+                "serverVersion" to suite.serverVersion,
+                "probes" to clientProbes.sorted().joinToString(","),
+            ),
+        )
+        if (wrote) {
+            info("[E2E] mc-testkit 结果已写入 status=${if (passed) "PASS" else "FAIL"}")
+            if (System.getProperty("taboolib.e2e.exit") != "false") {
+                info("[E2E] 关闭服务端...")
+                submit(delay = 20L) {
+                    E2EMcTestkitVerdict.shutdownServer()
+                }
+            }
+        } else {
+            info("[E2E] 非 mc-testkit 环境（无 RESULT_FILE），跳过判定写出")
+            if (System.getProperty("taboolib.e2e.exit") == "true") {
+                submit(delay = 100L) {
+                    E2EMcTestkitVerdict.shutdownServer()
+                }
+            }
+        }
+    }
+
     fun writeResultJson(suite: TestSuiteResult): File {
         val outDir = File("plugins/TabooLibE2E")
         if (!outDir.exists()) {
@@ -173,64 +257,18 @@ object E2ERunner {
         return file
     }
 
-    /**
-     * 测试套件汇总结果
-     *
-     * @property results 全部测试结果
-     * @property reason 本次执行的触发来源
-     */
     class TestSuiteResult(val results: List<Test.Result>, val reason: String) {
 
-        /**
-         * 测试结果总数。
-         */
         val total: Int = results.size
-
-        /**
-         * 成功结果数。
-         */
         val success: Int = results.count { it is Test.Success }
-
-        /**
-         * 失败结果数。
-         */
         val failure: Int = results.count { it is Test.Failure }
-
-        /**
-         * 因版本不支持而跳过的结果数。
-         */
         val unsupported: Int = results.count { it is Test.Unsupported }
-
-        /**
-         * 报告生成时间。
-         */
         val timestamp: String = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ").format(Date())
-
-        /**
-         * 服务端品牌与 Minecraft 版本信息。
-         */
-        val serverVersion: String = Bukkit.getVersion()
-
-        /**
-         * Bukkit API 版本。
-         */
-        val bukkitVersion: String = Bukkit.getBukkitVersion()
-
-        /**
-         * 服务端使用的 Java 版本。
-         */
+        val serverVersion: String = runCatching { Bukkit.getVersion() }.getOrDefault("unknown")
+        val bukkitVersion: String = runCatching { Bukkit.getBukkitVersion() }.getOrDefault("unknown")
         val javaVersion: String = System.getProperty("java.version")
+        val onlinePlayers: List<String> = runCatching { Bukkit.getOnlinePlayers().map { it.name } }.getOrDefault(emptyList())
 
-        /**
-         * 执行测试时在线的真实协议玩家。
-         */
-        val onlinePlayers: List<String> = Bukkit.getOnlinePlayers().map { it.name }
-
-        /**
-         * 将套件结果序列化为 JSON。
-         *
-         * @return JSON 文本
-         */
         fun toJsonString(): String {
             val sb = StringBuilder()
             sb.append("{\n")

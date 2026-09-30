@@ -1,0 +1,16 @@
+{
+  "name": "taboolib-e2e-bot",
+  "private": true,
+  "version": "1.0.0",
+  "description": "TabooLib E2E mineflayer bot for mc-testkit (join + client probes)",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "connect-and-wait": "node src/connectAndWait.js"
+  },
+  "dependencies": {
+    "@wcpe/mc-testkit-bot": "^0.1.0",
+    "mineflayer": "^4.23.0"
+  }
+}

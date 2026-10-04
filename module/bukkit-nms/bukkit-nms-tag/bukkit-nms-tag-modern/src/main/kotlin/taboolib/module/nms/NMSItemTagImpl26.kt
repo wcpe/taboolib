@@ -49,7 +49,20 @@ class NMSItemTagImpl26 : NMSItemTag() {
         return CraftItemStack.asNMSCopy(itemStack)
     }
 
+    /**
+     * Paper 26.3 起 `CraftItemStack.asCraftMirror` 更名为 `asBukkitMirror`（语义相同：镜像包装传入实例、不做复制）。
+     * 编译期依赖停在 26.1，其中不存在该方法，故按运行期方法查找；不用 `dynamic` 改写路径——
+     * 该调用形态在类加载验证阶段会报 `Operand stack underflow`。
+     */
+    private val asBukkitMirrorMethod by lazy {
+        CraftItemStack::class.java.getMethod("asBukkitMirror", net.minecraft.world.item.ItemStack::class.java)
+    }
+
     override fun getBukkitCopy(itemStack: Any): ItemStack {
+        // Paper 26.3
+        if (MinecraftVersion.isHigherOrEqual(MinecraftVersion.V26_3)) {
+            return asBukkitMirrorMethod.invoke(null, (itemStack as net.minecraft.world.item.ItemStack).copy()) as ItemStack
+        }
         // Paper 26.2
         if (MinecraftVersion.isHigherOrEqual(MinecraftVersion.V26_2)) {
             return CraftItemStack.asCraftMirror((itemStack as net.minecraft.world.item.ItemStack).copy())

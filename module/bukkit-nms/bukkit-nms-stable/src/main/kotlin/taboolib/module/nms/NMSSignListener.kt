@@ -46,7 +46,8 @@ internal object NMSSignListener {
         if ((event.packet.name == "PacketPlayInUpdateSign" || event.packet.name == "ServerboundSignUpdatePacket") && callback.containsKey(event.player.name)) {
             val function = callback.remove(event.player.name) ?: return
             val lines = when {
-                MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_17) -> event.packet.read<Array<String>>("lines")!!
+                // 26.3 起该字段由 String[] 变为 List<String>，统一为数组后再交给回调
+                MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_17) -> event.packet.read<Any>("lines").toSignLines()
                 MinecraftVersion.isHigherOrEqual(MinecraftVersion.V1_9) -> event.packet.read<Array<String>>("b")!!
                 else -> event.packet.read<Array<Any>>("b")!!.map { NMSSign.instance.deserialize(it) }.toTypedArray()
             }
@@ -57,6 +58,21 @@ internal object NMSSignListener {
             } else {
                 submit { function.invoke(lines) }
             }
+        }
+    }
+
+    /**
+     * 将牌子更新包中的行内容统一为数组。
+     * 26.3 起服务端的字段类型为 List，更早版本为 String[]，此处一并兼容。
+     *
+     * @return 牌子内容（固定 4 行）
+     */
+    private fun Any?.toSignLines(): Array<String> {
+        return when (this) {
+            null -> emptyArray()
+            is Array<*> -> map { it.toString() }.toTypedArray()
+            is Collection<*> -> map { it.toString() }.toTypedArray()
+            else -> arrayOf(toString())
         }
     }
 }

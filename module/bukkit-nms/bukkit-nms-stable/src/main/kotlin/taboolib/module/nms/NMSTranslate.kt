@@ -264,12 +264,24 @@ class NMSTranslateImpl : NMSTranslate() {
      *
      * 这种逆天的语言文件拼接在 1.13 版本后被移除。
      */
+    /**
+     * 26.3 起 `CraftItemStack.asCraftCopy` 被移除，等价入口改为 `getCraftStack`；
+     * 编译期依赖停在 26.1（无该方法），故按运行期方法查找。
+     */
+    private val craftStackMethod by lazy {
+        CraftItemStack::class.java.getMethod("getCraftStack", ItemStack::class.java)
+    }
+
     override fun getLanguageKey(itemStack: ItemStack): MinecraftLanguage.LanguageKey {
         // 使用 Translatable 接口
         if (isTranslatableSupported) {
             // Bukkit ItemStack 不一定是 CraftItemStack，直接读取 translationKey 会访问空的 craftDelegate。
             // 物品材质已经携带稳定的原版语言键，避免跨版本 CraftItemStack 委托差异。
-            val craftItem = CraftItemStack.asCraftCopy(itemStack)
+            val craftItem = if (MinecraftVersion.isHigherOrEqual(MinecraftVersion.V26_3)) {
+                craftStackMethod.invoke(null, itemStack) as CraftItemStack
+            } else {
+                CraftItemStack.asCraftCopy(itemStack)
+            }
             return MinecraftLanguage.LanguageKey(Type.NORMAL, craftItem.type.translationKey)
         }
         // region Legacy Version

@@ -23,8 +23,21 @@ dependencies {
     testImplementation("org.ow2.asm:asm-util:9.8")
 }
 
+// 性能验收用例（@Tag("perf")，如 WovenInvocationOverheadTest）耗时且数值受机器/GC 噪声影响，
+// 不适合作为每次构建的门禁：默认从常规 test 里排除，需要人工看数值时显式点名或显式开关放行。
+//   ./gradlew :module:incision:test --tests "*WovenInvocationOverheadTest*"
+//   ./gradlew :module:incision:test -PincisionPerf
+val runPerfTaggedTests: Boolean = hasProperty("incisionPerf") ||
+    gradle.startParameter.taskRequests.any { request ->
+        request.args.any { it == "--tests" || it.startsWith("--tests=") }
+    }
+
 tasks.test {
-    useJUnitPlatform()
+    useJUnitPlatform {
+        if (!runPerfTaggedTests) {
+            excludeTags("perf")
+        }
+    }
 }
 
 // native 产物校验：6 平台二进制是预编译入库的，C 源码改了却忘记重编不会有任何编译错误。

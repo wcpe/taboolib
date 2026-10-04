@@ -14,6 +14,7 @@ import taboolib.module.incision.gate.GateBootstrapper
 import taboolib.module.incision.lifecycle.AutoHealHandler
 import taboolib.module.incision.loader.InstrumentationBackend
 import taboolib.module.incision.loader.JvmtiBackend
+import taboolib.module.incision.loader.LoadTimings
 import taboolib.module.incision.loader.PipelineBackend
 import taboolib.module.incision.reflex.IncisionReflex
 import taboolib.module.incision.remap.RemapRouter
@@ -48,46 +49,63 @@ object IncisionBootstrap {
     }
 
     private fun prepareConst() {
-        // 0. asm-tree 运行时可用性自检（PrimitiveLoader bootstrap 新增）
-        probeAsmTree()
-        // 1. 尝试接入 TabooLib 的 NMS resolver（若 :module:bukkit-nms 在 classpath）
-        TabooLibNmsResolver.installIfAvailable()
-        // 2. 安装反射穿透适配器，让 TabooLib reflex 在 invoke 时自动 withoutIncision
-        IncisionReflex.installReflexAdapter()
-        // 3. 注入 IncisionBridge 到 bootstrap ClassLoader，使跨 CL 目标（NMS、Bukkit API）能解析桥类
-        //    必须在任何 installWeaver/retransform 之前完成
-        injectBridgeIntoSystemClassLoader()
-        Forensics.info("Incision CONST: api=$API_VERSION resolver=${RemapRouter.name()}")
-        // 5. 接入 TabooLib NMSProxy 管线末端（PipelineBackend）
-        PipelineBackend.installIntoTabooLib()
+        // 计时包裹仅为写入 LoadTimings 观测点（端到端验收读取加载速度），不改变任何既有行为
+        LoadTimings.timed(LoadTimings.CONST) {
+            // 0. asm-tree 运行时可用性自检（PrimitiveLoader bootstrap 新增）
+            LoadTimings.timed(LoadTimings.CONST_ASM_PROBE) { probeAsmTree() }
+            // 1. 尝试接入 TabooLib 的 NMS resolver（若 :module:bukkit-nms 在 classpath）
+            LoadTimings.timed(LoadTimings.CONST_NMS_RESOLVER) { TabooLibNmsResolver.installIfAvailable() }
+            // 2. 安装反射穿透适配器，让 TabooLib reflex 在 invoke 时自动 withoutIncision
+            LoadTimings.timed(LoadTimings.CONST_REFLEX_ADAPTER) { IncisionReflex.installReflexAdapter() }
+            // 3. 注入 IncisionBridge 到 bootstrap ClassLoader，使跨 CL 目标（NMS、Bukkit API）能解析桥类
+            //    必须在任何 installWeaver/retransform 之前完成
+            LoadTimings.timed(LoadTimings.CONST_BRIDGE_INJECT) { injectBridgeIntoSystemClassLoader() }
+            Forensics.info("Incision CONST: api=$API_VERSION resolver=${RemapRouter.name()}")
+            // 5. 接入 TabooLib NMSProxy 管线末端（PipelineBackend）
+            LoadTimings.timed(LoadTimings.CONST_PIPELINE) { PipelineBackend.installIntoTabooLib() }
+        }
     }
 
     @Awake(LifeCycle.ENABLE)
     fun onEnable() {
-        Forensics.info("Incision ENABLE: gate / 诊断收尾开始")
-        // 1. 接入 / 创建 IncisionGate
-        try {
-            val gate = IncisionGateLocator.locateOrCreate(API_VERSION)
-            CanonicalBridge.bindSystemHost(gate)
-            Forensics.info("Incision Gate online: api=${gate.apiVersion()}")
-        } catch (t: Throwable) {
-            Forensics.warn("Incision Gate 接入失败（将使用本地 dispatcher 兜底）：${t.javaClass.name}: ${t.message}")
-            if (Forensics.DEBUG) t.printStackTrace()
+        // 计时包裹仅为写入 LoadTimings 观测点（端到端验收读取加载速度），不改变任何既有行为
+        LoadTimings.timed(LoadTimings.ENABLE) {
+            Forensics.info("Incision ENABLE: gate / 诊断收尾开始")
+            // 1. 接入 / 创建 IncisionGate
+            LoadTimings.timed(LoadTimings.ENABLE_GATE) {
+                try {
+                    val gate = IncisionGateLocator.locateOrCreate(API_VERSION)
+                    CanonicalBridge.bindSystemHost(gate)
+                    Forensics.info("Incision Gate online: api=${gate.apiVersion()}")
+                } catch (t: Throwable) {
+                    Forensics.warn("Incision Gate 接入失败（将使用本地 dispatcher 兜底）：${t.javaClass.name}: ${t.message}")
+                    if (Forensics.DEBUG) t.printStackTrace()
+                }
+            }
+            // 2. 输出已注册切术的 startup checkup（此时 CONST 阶段的 @Surgeon 已完成注册）
+            LoadTimings.timed(LoadTimings.ENABLE_CHECKUP) { Checkup.runStartupCheckup() }
+            // 3. 跑全量冲突分析
+            LoadTimings.timed(LoadTimings.ENABLE_CONFLICT) {
+                for (r in ConflictAnalyzer.analyzeAll()) {
+                    ConflictAnalyzer.emit(r)
+                }
+            }
+            // 4. 输出 retransform 后端状态：优先 Instrumentation，回退到 JVMTI native
+            LoadTimings.timed(LoadTimings.ENABLE_BACKEND) {
+                if (InstrumentationBackend.available()) {
+                    Forensics.info("Instrumentation 后端就绪")
+                } else if (JvmtiBackend.available()) {
+                    Forensics.info("JVMTI native 后端就绪（Instrumentation 不可用）")
+                } else {
+                    Forensics.warn("Instrumentation / JVMTI 均不可用 — 仅 NMSProxy 生成期 Pipeline 路径可用")
+                }
+            }
         }
-        // 2. 输出已注册切术的 startup checkup（此时 CONST 阶段的 @Surgeon 已完成注册）
-        Checkup.runStartupCheckup()
-        // 3. 跑全量冲突分析
-        for (r in ConflictAnalyzer.analyzeAll()) {
-            ConflictAnalyzer.emit(r)
-        }
-        // 4. 输出 retransform 后端状态：优先 Instrumentation，回退到 JVMTI native
-        if (InstrumentationBackend.available()) {
-            Forensics.info("Instrumentation 后端就绪")
-        } else if (JvmtiBackend.available()) {
-            Forensics.info("JVMTI native 后端就绪（Instrumentation 不可用）")
-        } else {
-            Forensics.warn("Instrumentation / JVMTI 均不可用 — 仅 NMSProxy 生成期 Pipeline 路径可用")
-        }
+        // 加载耗时汇总（端到端验收的观测点；Forensics.info 仅在调试模式输出）
+        Forensics.info(
+            "Incision 加载耗时: CONST=${LoadTimings.millis(LoadTimings.CONST)}ms " +
+                "ENABLE=${LoadTimings.millis(LoadTimings.ENABLE)}ms"
+        )
     }
 
     @Awake(LifeCycle.DISABLE)

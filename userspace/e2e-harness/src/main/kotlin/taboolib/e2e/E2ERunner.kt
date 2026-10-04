@@ -26,6 +26,7 @@ object E2ERunner {
 
     private val expectedTestClasses = setOf(
         "taboolib.module.ai.test.TestSimpleAi",
+        "taboolib.module.incision.test.TestIncision",
         "taboolib.module.nms.test.TestDataSerializer",
         "taboolib.module.nms.test.TestMinecraftLanguage",
         "taboolib.module.nms.test.TestNMSEntity",

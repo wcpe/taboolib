@@ -41,30 +41,65 @@ data class AdviceEntry(
 
 /**
  * 单个目标方法的 advice 链 — 按优先级降序，同优先级按注册顺序。
+ *
+ * 读多写少：dispatch 每次调用都要取一次条目表，而增删只发生在注册 / 卸载期。
+ * 因此内部不暴露可变集合，而是"变更时整体重建 + volatile 发布不可变快照"：
+ * 读侧零拷贝、零锁，写侧用一把锁保证"改条目"与"发布快照"是同一个原子步骤
+ * （否则并发增删会互相覆盖，发布出永远停在旧状态的快照）。
  */
 class AdviceChain(val target: MethodCoordinate) {
 
-    private val entries = java.util.concurrent.CopyOnWriteArrayList<AdviceEntry>()
+    /** 写侧互斥锁；只用于 add / remove，热路径（[list]）完全不碰。 */
+    private val writeLock = Any()
+
+    private val entries = ArrayList<AdviceEntry>()
+
+    /** 读侧快照。每次变更后整体替换；读方拿到的引用在其使用期间内容不再变化。 */
+    @Volatile
+    private var snapshot: List<AdviceEntry> = emptyList()
 
     fun add(entry: AdviceEntry) {
-        // 聚合计划重装会再次同步逻辑/运行时别名；同一 id 必须替换而不是重复执行。
-        entries.removeIf { it.id == entry.id }
-        entries.add(entry)
-        entries.sortByDescending { it.priority }
-    }
-
-    fun remove(id: String): Boolean = entries.removeIf { it.id == id }
-
-    fun removeByClassLoader(cl: ClassLoader): Int {
-        var n = 0
-        entries.removeIf { e ->
-            val held = e.classLoader?.get()
-            if (held === cl) { n++; true } else false
+        synchronized(writeLock) {
+            // 聚合计划重装会再次同步逻辑/运行时别名；同一 id 必须替换而不是重复执行。
+            entries.removeIf { it.id == entry.id }
+            entries.add(entry)
+            entries.sortByDescending { it.priority }
+            publish()
         }
-        return n
     }
 
-    fun list(): List<AdviceEntry> = entries.toList()
+    fun remove(id: String): Boolean = synchronized(writeLock) {
+        val removed = entries.removeIf { it.id == id }
+        if (removed) publish()
+        removed
+    }
 
-    fun isEmpty(): Boolean = entries.isEmpty()
+    fun removeByClassLoader(cl: ClassLoader): Int = synchronized(writeLock) {
+        var n = 0
+        val iterator = entries.iterator()
+        while (iterator.hasNext()) {
+            val held = iterator.next().classLoader?.get()
+            if (held === cl) {
+                iterator.remove()
+                n++
+            }
+        }
+        if (n > 0) publish()
+        n
+    }
+
+    /**
+     * 热路径读入口：直接返回当前快照，不再逐次拷贝。
+     *
+     * 返回的是**不可修改视图**：调用方拿到的不是私有副本，任何改动都必须失败
+     * （抛出 [UnsupportedOperationException]），而不是静默污染整条链。
+     */
+    fun list(): List<AdviceEntry> = snapshot
+
+    fun isEmpty(): Boolean = snapshot.isEmpty()
+
+    /** 在锁内重建并发布快照：先复制成独立副本，再包成不可修改视图。 */
+    private fun publish() {
+        snapshot = java.util.Collections.unmodifiableList(ArrayList(entries))
+    }
 }

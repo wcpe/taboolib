@@ -1,6 +1,10 @@
 package io.izzel.incision.bridge;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
@@ -30,7 +34,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *   <li>本地没有可用路由时再交给系统 ClassLoader 上的 Gate。</li>
  * </ol>
  *
- * 本类通过反射跨 ClassLoader 调用 dispatch，避免类型一致性问题。
+ * 本类通过 MethodHandle（unreflect 成功时）或反射（访问控制不允许时）跨 ClassLoader 调用
+ * dispatch，避免类型一致性问题。两条路径的异常语义必须一致，见 {@link #invokeRoute}。
  */
 public final class IncisionBridge {
 
@@ -38,14 +43,42 @@ public final class IncisionBridge {
 
     private static final Object BYPASS_MISS = new Object();
 
+    /**
+     * 路由句柄类型：3 参与 4 参两种 dispatch 统一归一化到这一种。
+     *
+     * 调用点因此保持单态（MethodHandle.invoke 是签名多态方法，调用点类型须稳定才能被 JIT 内联）；
+     * 第 4 位是 4 参 dispatch 的额外参数，3 参形态由 dropArguments 补一个被丢弃的占位。
+     *
+     * 必须声明在 systemHandle 之前：静态初始化按文本顺序执行，晚声明会让初始化期的句柄解析
+     * 拿到 null 类型而静默退化。
+     */
+    private static final MethodType ROUTE_TYPE =
+        MethodType.methodType(Object.class, String.class, Object.class, Object[].class, Object.class);
+
     /** 系统 ClassLoader 上的宿主类（若存在） */
     private static volatile Object systemHost = findSystemHost();
 
     /** 宿主的 dispatch 方法反射缓存 */
     private static volatile Method systemDispatch = resolveDispatch(systemHost);
 
+    /** 宿主 dispatch 的句柄缓存（receiver 已绑定）；为 null 时回落反射 */
+    private static volatile MethodHandle systemHandle = resolveRouteHandle(systemDispatch, systemHost);
+
     /** ClassLoader → 本地 TheatreDispatcher.dispatch Method 缓存（单插件 fallback 路径） */
     private static final ConcurrentHashMap<ClassLoader, Method> localCache = new ConcurrentHashMap<ClassLoader, Method>();
+
+    /**
+     * dispatcher 声明类 → 已归一化的 dispatch 句柄。
+     *
+     * 为什么不把句柄直接放进 localCache / targetRoutes 的值里：bootstrap 注入协议只复制
+     * IncisionBridge.class 一份字节码（见 IncisionBootstrap 的注入逻辑），任何
+     * IncisionBridge$Xxx.class 在 bootstrap ClassLoader 中都不存在，所以这里不能为路由定义包装类。
+     *
+     * 一个 dispatcher 类只有一个 dispatch（pickDispatchMethod 的选法），因此以声明类为键没有歧义；
+     * 键是 Class，hashCode 为 identity hash，热路径查找成本远低于一次反射调用。
+     */
+    private static final ConcurrentHashMap<Class<?>, MethodHandle> routeHandles =
+        new ConcurrentHashMap<Class<?>, MethodHandle>();
 
     /**
      * 运行时目标签名 → 声明该目标的 dispatcher。
@@ -105,12 +138,10 @@ public final class IncisionBridge {
             boolean invoked = false;
             for (Method local : locals) {
                 try {
-                    Object localResult;
-                    if (local.getParameterCount() == 4) {
-                        localResult = local.invoke(null, targetSignature, self, args, null);
-                    } else {
-                        localResult = local.invoke(null, targetSignature, self, args);
-                    }
+                    // 句柄优先（每类一条，未命中即回落反射）；receiver 为 null —— 本地 dispatch 是静态方法
+                    Object localResult = invokeRoute(
+                        local, routeHandles.get(local.getDeclaringClass()), null, targetSignature, self, args
+                    );
                     // 未持有该 target 的 dispatcher 以 null 表示未命中，不能覆盖前一个插件的有效结果。
                     if (localResult != null) result = localResult;
                     invoked = true;
@@ -124,7 +155,7 @@ public final class IncisionBridge {
         Object host = systemHost;
         if (m != null && host != null) {
             try {
-                return m.invoke(host, targetSignature, self, args);
+                return invokeRoute(m, systemHandle, host, targetSignature, self, args);
             } catch (Throwable t) {
                 System.err.println("[Incision][Bridge] system host dispatch failed: " + t);
             }
@@ -222,13 +253,17 @@ public final class IncisionBridge {
 
     /** 宿主绑定入口 — GateBootstrapper 创建 host 后调用此方法完成注册 */
     public static synchronized void bindSystemHost(Object host) {
+        Method dispatch = resolveDispatch(host);
+        // 先发布句柄再发布 Method/host：读到 host 的线程同时也应看到对应的句柄选择。
+        systemHandle = resolveRouteHandle(dispatch, host);
+        systemDispatch = dispatch;
         systemHost = host;
-        systemDispatch = resolveDispatch(host);
     }
 
     public static synchronized void unbindSystemHost() {
-        systemHost = null;
+        systemHandle = null;
         systemDispatch = null;
+        systemHost = null;
     }
 
     public static boolean hasSystemHost() {
@@ -394,6 +429,9 @@ public final class IncisionBridge {
             if (route.getDeclaringClass() == dispatcherClass) return;
         }
         routes.add(dispatch);
+        // 句柄解析失败（访问控制等）时保持空白，dispatch 会回落反射 —— 绝不能因此断链。
+        MethodHandle handle = resolveRouteHandle(dispatch, null);
+        if (handle != null) routeHandles.putIfAbsent(dispatcherClass, handle);
         if (routes.size() > 1 && routeConflictWarnings.putIfAbsent(base, Boolean.TRUE) == null) {
             System.err.println("[Incision][Bridge] multiple dispatchers registered for target=" + base +
                 " routes=" + routes.size() + " (cross-plugin priority requires Gate aggregation)");
@@ -411,7 +449,18 @@ public final class IncisionBridge {
         if (routes.size() <= 1) routeConflictWarnings.remove(base);
     }
 
+    /** 目标签名 → 基础签名（去掉 adviceId 与 phase）的 memo：签名是织入期写死的常量、取值有限，纯函数无需失效。 */
+    private static final ConcurrentHashMap<String, String> baseSignatureCache = new ConcurrentHashMap<String, String>();
+
     private static String baseSignature(String targetSignature) {
+        String cached = baseSignatureCache.get(targetSignature);
+        if (cached != null) return cached;
+        String computed = baseSignatureUncached(targetSignature);
+        baseSignatureCache.putIfAbsent(targetSignature, computed);
+        return computed;
+    }
+
+    private static String baseSignatureUncached(String targetSignature) {
         int hash = targetSignature.indexOf('#');
         String withoutAdvice = hash < 0 ? targetSignature : targetSignature.substring(0, hash);
         int phase = withoutAdvice.lastIndexOf('@');
@@ -423,8 +472,59 @@ public final class IncisionBridge {
         if (dispatcherClass == null) return;
         Method best = pickDispatchMethod(dispatcherClass);
         if (best != null) {
+            MethodHandle handle = resolveRouteHandle(best, null);
+            if (handle != null) routeHandles.put(dispatcherClass, handle);
             localCache.put(dispatcherClass.getClassLoader(), best);
         }
+    }
+
+    /**
+     * 把 dispatch 方法编译成归一化路由句柄；任何失败都返回 null，由调用方回落反射。
+     *
+     * unreflect 要做访问控制检查：跨插件 ClassLoader、声明方非公开、模块不导出等场景都可能失败。
+     * 这些场景下必须保留优化前就存在的 Method.invoke 路径 —— 拿不到句柄不是断链的理由。
+     *
+     * @param receiver 非 null 时按实例方法 bindTo（Gate host 的 dispatch 是实例方法）
+     */
+    private static MethodHandle resolveRouteHandle(Method method, Object receiver) {
+        if (method == null) return null;
+        try {
+            MethodHandle handle = MethodHandles.lookup().unreflect(method);
+            if (receiver != null) handle = handle.bindTo(receiver);
+            // 3 参形态补一个被丢弃的第 4 参，与 4 参形态对齐到同一个 MethodType
+            return handle.type().parameterCount() == 4
+                ? handle.asType(ROUTE_TYPE)
+                : MethodHandles.dropArguments(handle, 3, Object.class);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 执行一条路由：句柄可用时走 MethodHandle，否则走反射。
+     *
+     * 异常语义必须与优化前完全一致：Method.invoke 会把 handler 抛出的任何 Throwable 包成
+     * InvocationTargetException，而 MethodHandle.invoke 会原样抛出。这里显式补回同样的包装，
+     * 保证 Bridge 的日志文案与上层可观察行为（含异常类型）不因换用句柄而改变。
+     */
+    private static Object invokeRoute(
+        Method method,
+        MethodHandle handle,
+        Object receiver,
+        String targetSignature,
+        Object self,
+        Object[] args
+    ) throws Throwable {
+        if (handle != null) {
+            try {
+                return handle.invoke(targetSignature, self, args, (Object) null);
+            } catch (Throwable t) {
+                throw new InvocationTargetException(t);
+            }
+        }
+        return method.getParameterCount() == 4
+            ? method.invoke(receiver, targetSignature, self, args, null)
+            : method.invoke(receiver, targetSignature, self, args);
     }
 
     /** 借鉴 MeteorInjector 的 getMethod(clazz, returnType, index) 风格 — 形状优先，名字次之 */
@@ -459,6 +559,10 @@ public final class IncisionBridge {
     public static void unregisterLocalDispatcher(ClassLoader cl) {
         if (cl == null) return;
         localCache.remove(cl);
+        // 句柄与 Method 一样强引用声明类，必须随 lease 一起释放，否则会拖住插件 ClassLoader。
+        for (Class<?> dispatcherClass : new ArrayList<Class<?>>(routeHandles.keySet())) {
+            if (dispatcherClass.getClassLoader() == cl) routeHandles.remove(dispatcherClass);
+        }
         for (String target : new ArrayList<String>(targetRoutes.keySet())) {
             unregisterLocalTarget(cl, target);
         }

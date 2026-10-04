@@ -190,12 +190,25 @@ object TheatreDispatcher {
             return originalInvoker?.invoke(args)
         }
         val isThrowPhase = phase == "TRAIL_THROW"
-        val entries = chain.list().filter { e ->
-            if (!e.enabled) return@filter false
-            if (adviceId != null) return@filter e.id == adviceId
-            if (phase == null) return@filter true
-            if (isThrowPhase) return@filter e.kind == AdviceKind.TRAIL && e.onThrow
-            matchesPhase(e, phase)
+        // 链快照是不可修改视图，按下标遍历 + 预分配即可，无需 filter 额外产生的迭代器与默认容量表。
+        val snapshot = chain.list()
+        val entries = ArrayList<AdviceEntry>(snapshot.size)
+        for (i in snapshot.indices) {
+            val e = snapshot[i]
+            if (!e.enabled) continue
+            if (adviceId != null) {
+                if (e.id == adviceId) entries.add(e)
+                continue
+            }
+            if (phase == null) {
+                entries.add(e)
+                continue
+            }
+            if (isThrowPhase) {
+                if (e.kind == AdviceKind.TRAIL && e.onThrow) entries.add(e)
+            } else if (matchesPhase(e, phase)) {
+                entries.add(e)
+            }
         }
         if (entries.isEmpty()) {
             if (adviceId != null) Forensics.warn("Site dispatch 未找到 advice: target=$baseSig advice=$adviceId")
@@ -235,11 +248,21 @@ object TheatreDispatcher {
         val adviceId = parsedSig.adviceId
         val phase = parsedSig.phase
         val chain = chains[baseSig] ?: return BYPASS_MISS
-        val entries = chain.list().filter { e ->
-            if (!e.enabled) return@filter false
-            if (adviceId != null) return@filter e.id == adviceId
-            if (phase == null) return@filter e.kind == AdviceKind.BYPASS
-            matchesPhase(e, phase)
+        // 与 dispatch 同理：快照按下标挑选，避免 filter 的迭代器与临时表分配。
+        val snapshot = chain.list()
+        val entries = ArrayList<AdviceEntry>(snapshot.size)
+        for (i in snapshot.indices) {
+            val e = snapshot[i]
+            if (!e.enabled) continue
+            if (adviceId != null) {
+                if (e.id == adviceId) entries.add(e)
+                continue
+            }
+            if (phase == null) {
+                if (e.kind == AdviceKind.BYPASS) entries.add(e)
+            } else if (matchesPhase(e, phase)) {
+                entries.add(e)
+            }
         }
         if (entries.isEmpty()) return BYPASS_MISS
         val ctx = TheatreImpl(chain.target, self, args, entries, null)

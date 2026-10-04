@@ -1,6 +1,7 @@
 package taboolib.module.incision.runtime
 
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * dispatch 签名协议编解码。
@@ -18,6 +19,17 @@ object DispatchSignatureCodec {
     private const val advicePrefix = "b64:"
     private val phaseSuffixes = setOf("LEAD", "TRAIL", "SPLICE", "TRAIL_THROW")
 
+    /**
+     * `targetSig → 解析结果` 缓存。
+     *
+     * targetSig 由 weaver 以 LDC 常量写死在字节码里，**每个织入点一条、取值集合有限**；
+     * 而解析是纯函数（同一入参必然得到同一结果），因此不需要任何失效逻辑。
+     *
+     * 缓存前每次 dispatch 都要付 lastIndexOf / 两次 substring，site 入口还要 Base64 解码 ——
+     * 这些属于被织入方法的固定开销，与 advice 逻辑无关；缓存后热路径退化为一次 map 查找。
+     */
+    private val cache = ConcurrentHashMap<String, Parsed>()
+
     data class Parsed(
         val baseSig: String,
         val adviceId: String?,
@@ -30,6 +42,16 @@ object DispatchSignatureCodec {
     }
 
     fun parse(targetSig: String): Parsed {
+        val cached = cache[targetSig]
+        if (cached != null) return cached
+        val parsed = parseUncached(targetSig)
+        // 并发下重复解析无害：结果只由入参决定，先写入者胜出，后到者读到的必然是同一个值。
+        cache.putIfAbsent(targetSig, parsed)
+        return parsed
+    }
+
+    /** 真正的解析逻辑；只允许 [parse] 调用，保证所有调用方共享同一份缓存。 */
+    private fun parseUncached(targetSig: String): Parsed {
         val (sigWithoutPhase, phase) = splitPhase(targetSig)
         val hashIdx = sigWithoutPhase.indexOf('#')
         if (hashIdx < 0) return Parsed(sigWithoutPhase, null, phase)

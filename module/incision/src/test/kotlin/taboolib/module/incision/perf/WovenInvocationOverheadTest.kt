@@ -256,8 +256,13 @@ class WovenInvocationOverheadTest {
         /** 采样轮数；取中位数而非均值，避开偶发 GC / 抢占导致的离群轮次。 */
         const val MEASURE_ROUNDS = 7
 
-        const val WARMUP_ROUNDS = 4
-        const val WARMUP_ITERATIONS = 60_000
+        /**
+         * 预热轮数与每轮迭代：这条链路跨「目标方法 → Bridge → MethodHandle → Dispatcher → 链」五层，
+         * 实测需 ~1M 次调用才收敛到稳态——旧的 240K 次（4 × 60,000）下前几轮仍偏高约 40%，
+         * 既会让形态之间的比较失真，也会让"优化前后"的对比带上系统性偏差。
+         */
+        const val WARMUP_ROUNDS = 6
+        const val WARMUP_ITERATIONS = 200_000
 
         /** 黑盒发布间隔掩码（2^n - 1）。 */
         const val PUBLISH_MASK = 0x3FF

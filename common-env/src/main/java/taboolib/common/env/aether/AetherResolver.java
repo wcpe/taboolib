@@ -57,10 +57,7 @@ public class AetherResolver {
     private final List<RemoteRepository> repositories;
 
     public AetherResolver(String repo) {
-        DefaultServiceLocator locator = MavenRepositorySystemUtils.newServiceLocator();
-        locator.addService(RepositoryConnectorFactory.class, BasicRepositoryConnectorFactory.class);
-        locator.addService(TransporterFactory.class, HttpTransporterFactory.class);
-        this.repository = locator.getService(RepositorySystem.class);
+        this.repository = createRepositorySystem();
         this.session = MavenRepositorySystemUtils.newSession();
         this.session.setChecksumPolicy("fail");
         this.session.setLocalRepositoryManager(this.repository.newLocalRepositoryManager(this.session, new LocalRepository("libraries")));
@@ -74,6 +71,45 @@ public class AetherResolver {
         this.repositories = this.repository.newResolutionRepositories(this.session, Collections.singletonList(
                 new RemoteRepository.Builder("central", "default", repo).build()
         ));
+    }
+
+    /**
+     * 创建依赖解析系统，兼容新旧两代服务端自带的 Maven Resolver。
+     *
+     * <p>Maven 3.10（对应 maven-resolver 2）移除了 {@code MavenRepositorySystemUtils.newServiceLocator()}，
+     * 而 BungeeCord 等平台升级后会直接带走服务端内置的解析库，旧调用方式将在运行期抛出
+     * {@code NoSuchMethodError}。因此这里改为优先使用新版的 {@code RepositorySystemSupplier}
+     * （由 maven-resolver-provider 提供，旧版不存在），不存在时回退到旧版 ServiceLocator。
+     *
+     * <p>新版分支必须使用反射：本项目编译期依赖为 resolver 1.x，无法直接引用新版专有类型。
+     * 旧版分支拆分为独立方法，保证在 resolver 2 环境下该方法体不会被链接执行。
+     */
+    private static RepositorySystem createRepositorySystem() {
+        try {
+            Class<?> supplierClass = Class.forName("org.apache.maven.repository.supplier.RepositorySystemSupplier");
+            Object supplier = supplierClass.getConstructor().newInstance();
+            return (RepositorySystem) supplierClass.getMethod("get").invoke(supplier);
+        } catch (ClassNotFoundException ignored) {
+            // 旧版服务端不提供该类，回退到 Legacy 分支
+        } catch (Throwable ignored) {
+            // 类存在但构建失败（依赖缺失等），同样回退到 Legacy 分支
+        }
+        return createLegacyRepositorySystem();
+    }
+
+    /**
+     * 旧版依赖解析系统（maven-resolver 1.x）。
+     *
+     * <p>注意：本方法含有对 {@code newServiceLocator()} 的调用，在 resolver 2 环境下该符号无法解析。
+     * JVM 仅在方法实际执行时才链接调用点，因此只要 {@link #createRepositorySystem()} 走了新版分支，
+     * 本方法不会被触发。
+     */
+    @SuppressWarnings("deprecation")
+    private static RepositorySystem createLegacyRepositorySystem() {
+        DefaultServiceLocator locator = MavenRepositorySystemUtils.newServiceLocator();
+        locator.addService(RepositoryConnectorFactory.class, BasicRepositoryConnectorFactory.class);
+        locator.addService(TransporterFactory.class, HttpTransporterFactory.class);
+        return locator.getService(RepositorySystem.class);
     }
 
     public List<File> resolve(@NotNull String library, List<DependencyScope> scope, boolean isTransitive, boolean ignoreOptional) {

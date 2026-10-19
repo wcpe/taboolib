@@ -9,7 +9,6 @@ import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
 import java.util.jar.JarEntry;
@@ -237,18 +236,23 @@ public class PrimitiveLoader {
                 rel.add(new Relocation(kt + ".", PrimitiveSettings.getRelocatedKotlinVersion() + "."));
                 rel.add(new Relocation(ktc + ".", PrimitiveSettings.getRelocatedKotlinCoroutinesVersion() + "."));
             }
-            // 是否重定向
-            String hash = PrimitiveIO.getHash(file.getName() + deepHashCode(relocate) + KOTLIN_VERSION + KOTLIN_COROUTINES_VERSION);
+            // 计算缓存文件
+            String hash = relocateCacheHash(file, relocate);
             String name = file.getName().substring(0, file.getName().lastIndexOf('.'));
             jar = new File(getCacheFile(), name + "-" + hash.substring(0, 8) + ".jar");
-            // 文件为空 || 开发模式 || 强制重定向
-            if ((!jar.exists() && jar.length() == 0) || (IS_FORCE_DOWNLOAD_IN_DEV_MODE && IS_DEV_MODE) || forceRelocate) {
+            // 缓存不可用时重建
+            if (!isCacheUsable(jar, hash) || (IS_FORCE_DOWNLOAD_IN_DEV_MODE && IS_DEV_MODE) || forceRelocate) {
                 jar.getParentFile().mkdirs();
                 try {
                     new JarRelocator(PrimitiveIO.copyFile(file, File.createTempFile(file.getName(), ".jar")), jar, rel).run();
                 } catch (Throwable e) {
+                    // 重定向失败时不留下半成品，否则下次启动会把它当成有效缓存复用
+                    //noinspection ResultOfMethodCallIgnored
+                    jar.delete();
                     throw new RuntimeException(t("无法重定向 " + file, "Failed to relocate " + file), e);
                 }
+                // 写入标记：内容指纹与重定向规则指纹，供后续启动校验
+                writeCacheMarker(jar, hash);
             }
         }
         ClassLoader loader = ClassAppender.addPath(jar.toPath(), isIsolated, isExternal);
@@ -343,11 +347,92 @@ public class PrimitiveLoader {
         }
     }
 
-    static int deepHashCode(List<String[]> array) {
-        int result = 1;
-        for (String[] element : array) {
-            result = 31 * result + Arrays.deepHashCode(element);
+    /**
+     * 计算重定位缓存的指纹。
+     *
+     * <p>指纹必须覆盖<b>所有会改变产物内容的输入</b>：源文件名、重定向规则、以及
+     * Kotlin 相关的重定位开关与目标包名。历史上这里只用了源文件名、规则列表和 Kotlin
+     * 版本号，而真正参与重定位的规则还额外包含两条 Kotlin 规则（见 {@link #loadFile}），
+     * 两者不完全重合，因此当"规则变了但版本号没变"时会产生同名不同内容的缓存。</p>
+     *
+     * @param file     源文件
+     * @param relocate 重定向规则
+     * @return 十六进制指纹
+     */
+    static String relocateCacheHash(File file, List<String[]> relocate) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(file.getName()).append('|');
+        // 规则顺序会影响产物，按原顺序拼接
+        for (String[] r : relocate) {
+            sb.append(r[0]).append('>').append(r[1]).append(';');
         }
-        return result;
+        sb.append('|');
+        // Kotlin 重定位的实际参数
+        sb.append(SKIP_KOTLIN_RELOCATE).append(';');
+        sb.append(KOTLIN_VERSION).append(';');
+        sb.append(KOTLIN_COROUTINES_VERSION).append(';');
+        if (!SKIP_KOTLIN_RELOCATE) {
+            sb.append(PrimitiveSettings.getRelocatedKotlinVersion()).append(';');
+            sb.append(PrimitiveSettings.getRelocatedKotlinCoroutinesVersion()).append(';');
+        }
+        return PrimitiveIO.getHash(sb.toString());
+    }
+
+    /**
+     * 判断重定位缓存是否可复用。
+     *
+     * <p>除"文件存在且非空"外，还校验伴随标记文件里写下的规则指纹与产物内容指纹，
+     * 避免复用到由不同规则生成、或内容已被破坏的旧产物。缺标记的旧缓存一律视为不可用，
+     * 会被重建一次（这正是历史缺陷的兜底：旧版本生成的缓存没有标记，升级后自动重建）。</p>
+     *
+     * @param jar      缓存文件
+     * @param ruleHash 当前预期的规则指纹
+     * @return 是否可复用
+     */
+    static boolean isCacheUsable(File jar, String ruleHash) {
+        if (!jar.isFile() || jar.length() == 0) {
+            return false;
+        }
+        File marker = cacheMarkerFile(jar);
+        if (!marker.isFile()) {
+            return false;
+        }
+        try {
+            String expected = PrimitiveIO.readFile(marker).trim();
+            return !expected.isEmpty() && expected.equals(cacheMarkerContent(jar, ruleHash));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * 写入缓存标记，记录重定向规则指纹。
+     */
+    static void writeCacheMarker(File jar, String ruleHash) {
+        try {
+            File marker = cacheMarkerFile(jar);
+            marker.getParentFile().mkdirs();
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(marker)) {
+                fos.write(cacheMarkerContent(jar, ruleHash).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+        } catch (IOException e) {
+            PrimitiveIO.debug("无法写入重定位缓存标记 {0}，下次启动将重建该缓存。", jar.getName());
+        }
+    }
+
+    /**
+     * 缓存标记文件路径。
+     */
+    static File cacheMarkerFile(File jar) {
+        return new File(jar.getParentFile(), jar.getName() + ".marker");
+    }
+
+    /**
+     * 标记内容：规则指纹 + 产物自身内容指纹。
+     *
+     * <p>产物内容指纹用于发现"文件被替换或被截断"这类与规则无关的损坏。</p>
+     */
+    private static String cacheMarkerContent(File jar, String ruleHash) {
+        return jar.getName() + ':' + (ruleHash == null ? "" : ruleHash) + ':' + PrimitiveIO.getHash(jar);
     }
 }

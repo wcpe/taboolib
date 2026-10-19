@@ -120,8 +120,11 @@ jobs:
           declare -A bucket
 
           # 用制表符(0x09)分隔短哈希与标题；提交标题一般不含制表符
+          # 注意：git log --pretty=format: 的输出最后一条记录没有终止符，而 read 在遇到
+          # EOF 且缺少分隔符时会丢弃该行，导致「最老的那条提交」永远进不了变更日志。
+          # 因此用 -z 让记录以 NUL 分隔，并在末尾显式补一个 NUL，确保最后一条也被读出。
           re='^([a-zA-Z]+)(\([^)]*\))?!?:'
-          while IFS=$'\t' read -r h s; do
+          while IFS=$'\t' read -r -d '' h s; do
             [ -n "${h}" ] || continue
             if [[ "${s}" =~ $re ]]; then
               t="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
@@ -130,7 +133,7 @@ jobs:
             fi
             [ -n "${title[${t}]:-}" ] || t="other"
             bucket[${t}]+="- ${s} (\`${h}\`)"$'\n'
-          done < <(git log --no-merges --pretty=format:'%h%x09%s' "${log_args[@]}")
+          done < <({ git log --no-merges -z --pretty=format:'%h%x09%s' "${log_args[@]}"; printf '\0'; })
 
           for t in "${order[@]}"; do
             if [ -n "${bucket[${t}]:-}" ]; then

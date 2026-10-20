@@ -1,0 +1,54 @@
+name: 测试
+
+# 触发：推送到 main、向 main 发起 PR、以及手动触发。
+# 发布工作流只在推 tag 时运行，平时缺少一道回归，这里补上：
+# 任何进入 main 的改动都会先跑一遍单元测试，避免把编译不过或测试失败的代码推到发布环节。
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+# 同一分支的重复推送取消上一次运行，节省时间；PR 与 main 分组隔离，互不打断
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 配置 JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          # 与发布工作流保持一致：仓库依赖 1.21.x NMS（v61）与 Hytale（hytale-server v65=Java 21），
+          # 构建 JDK 必须为 21 才能读取全部依赖字节码；产物仍按 jvmTarget=1.8 输出
+          java-version: '21'
+          cache: gradle
+
+      - name: 授予 gradlew 执行权限
+        run: chmod +x ./gradlew
+
+      - name: 运行单元测试
+        # e2e 依赖真实服务端与外部网络，不在 CI 中运行；这里只跑纯单元测试
+        run: ./gradlew test --no-daemon --console=plain --stacktrace
+
+      - name: 收集测试报告
+        # 测试失败时仍要上传报告，便于定位具体用例
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/build/reports/tests/test
+            **/build/test-results/test
+          retention-days: 7

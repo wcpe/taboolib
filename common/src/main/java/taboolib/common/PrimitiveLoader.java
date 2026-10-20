@@ -98,9 +98,9 @@ public class PrimitiveLoader {
             for (String[] i : deps()) {
                 load(REPO_CENTRAL, i[0], i[1], i[2], IS_ISOLATED_MODE, true, rule());
             }
-            // 加载反射模块
-            load(REPO_REFLEX, TABOOPROJECT_GROUP + ".reflex", "reflex", ReflexVersion.VERSION, IS_ISOLATED_MODE, true, rule());
-            load(REPO_REFLEX, TABOOPROJECT_GROUP + ".reflex", "analyser", ReflexVersion.VERSION, IS_ISOLATED_MODE, true, rule());
+            // 加载反射模块（wcpe 优先，官方仓库兜底）
+            load(REPO_REFLEX_LIST, TABOOPROJECT_GROUP + ".reflex", "reflex", ReflexVersion.VERSION, IS_ISOLATED_MODE, true, rule());
+            load(REPO_REFLEX_LIST, TABOOPROJECT_GROUP + ".reflex", "analyser", ReflexVersion.VERSION, IS_ISOLATED_MODE, true, rule());
         });
         PrimitiveIO.debug("基础依赖加载完成，用时 {0} 毫秒。", time);
         // 加载完整模块
@@ -118,51 +118,57 @@ public class PrimitiveLoader {
      * @param isExternal 是否属于外部库（不会扫描类）
      */
     static boolean load(String repo, String group, String name, String version, boolean isIsolated, boolean isExternal, List<String[]> relocate) {
+        return load(new String[]{repo}, group, name, version, isIsolated, isExternal, relocate);
+    }
+
+    /**
+     * 从多个仓库下载模块并加载，按顺序尝试，前一个仓库下载失败则回退到下一个。
+     *
+     * @param repos      候选仓库地址（按优先级排列）
+     * @param group      组
+     * @param name       构件名
+     * @param version    版本
+     * @param isIsolated 是否进入沙盒
+     * @param isExternal 是否属于外部库（不会扫描类）
+     */
+    static boolean load(String[] repos, String group, String name, String version, boolean isIsolated, boolean isExternal, List<String[]> relocate) {
         if (name.isEmpty()) return false;
         boolean downloaded = false;
         // SNAPSHOT 版本需要先查询 maven-metadata.xml 获取实际带时间戳的文件名
-        String resolvedFileName = version.endsWith("-SNAPSHOT")
-                ? resolveSnapshotFileName(repo, group, name, version)
-                : null;
+        // 逐个仓库尝试解析，只要某个仓库能给出实际文件名即可（各仓库的时间戳可能不同）
+        String resolvedFileName = null;
+        if (version.endsWith("-SNAPSHOT")) {
+            for (String repo : repos) {
+                resolvedFileName = resolveSnapshotFileName(repo, group, name, version);
+                if (resolvedFileName != null) {
+                    break;
+                }
+            }
+        }
         // 本地保存文件名：SNAPSHOT 使用带时间戳的文件名，否则使用标准格式
         String localFileName = resolvedFileName != null ? resolvedFileName : String.format("%s-%s.jar", name, version);
         File envFile = new File(getLibraryFile(), String.format("%s/%s/%s/%s", group.replace(".", "/"), name, version, localFileName));
         File shaFile = new File(getLibraryFile(), String.format("%s/%s/%s/%s.sha1", group.replace(".", "/"), name, version, localFileName));
         // 检查文件有效性
         if (!PrimitiveIO.validation(envFile, shaFile) || (IS_FORCE_DOWNLOAD_IN_DEV_MODE && IS_DEV_MODE && group.equals(TABOOLIB_GROUP))) {
-            try {
-                PrimitiveIO.println(t("正在下载依赖 {0}:{1}:{2}", "Downloading library {0}:{1}:{2}"),
-                        group,
-                        name,
-                        version
-                );
-                // 获取远程下载地址
-                String url;
-                if (resolvedFileName != null) {
-                    url = String.format("%s/%s/%s/%s/%s", repo, group.replace(".", "/"), name, version, resolvedFileName);
-                } else {
-                    url = String.format("%s/%s/%s/%s/%s-%s.jar", repo, group.replace(".", "/"), name, version, name, version);
+            PrimitiveIO.println(t("正在下载依赖 {0}:{1}:{2}", "Downloading library {0}:{1}:{2}"),
+                    group,
+                    name,
+                    version
+            );
+            // 依次尝试候选仓库，任意一个成功即停止
+            boolean success = false;
+            for (String repo : repos) {
+                if (tryDownload(repo, group, name, version, resolvedFileName, envFile, shaFile)) {
+                    success = true;
+                    break;
                 }
-                // 下载 jar
-                PrimitiveIO.downloadFile(new URL(url), envFile);
-                // 尝试下载 sha1 文件；本地 file:// 仓库可能没有 sha1，则用 jar 自行生成
-                try {
-                    PrimitiveIO.downloadFile(new URL(url + ".sha1"), shaFile);
-                } catch (IOException ignored) {
-                    if (IS_DEV_MODE) {
-                        PrimitiveIO.debug("无法下载 {0}-{1}.jar.sha1，将用 jar 自行生成。", name, version);
-                        if (envFile.exists()) {
-                            generateSha1File(envFile, shaFile);
-                        }
-                    } else {
-                        throw new IOException("无法下载 " + url + ".sha1");
-                    }
-                }
-                downloaded = true;
-            } catch (IOException e) {
-                e.printStackTrace();
+            }
+            if (!success) {
+                PrimitiveIO.println(t("无法下载 {0}-{1}.jar", "Failed to download {0}-{1}.jar"), name, version);
                 return false;
             }
+            downloaded = true;
             // 检查合法性
             if (!PrimitiveIO.validation(envFile, shaFile)) {
                 PrimitiveIO.println(t("无法下载 {0}-{1}.jar", "Failed to download {0}-{1}.jar"), name, version);
@@ -179,6 +185,51 @@ public class PrimitiveLoader {
     }
 
     /**
+     * 尝试从单个仓库下载 jar 与 sha1 文件。
+     * 下载失败时会清理残留文件，避免下一个仓库或后续校验读到半成品。
+     *
+     * @return 是否下载成功
+     */
+    static boolean tryDownload(String repo, String group, String name, String version, String resolvedFileName, File envFile, File shaFile) {
+        // 获取远程下载地址
+        String url;
+        if (resolvedFileName != null) {
+            url = String.format("%s/%s/%s/%s/%s", repo, group.replace(".", "/"), name, version, resolvedFileName);
+        } else {
+            url = String.format("%s/%s/%s/%s/%s-%s.jar", repo, group.replace(".", "/"), name, version, name, version);
+        }
+        try {
+            // 下载 jar
+            PrimitiveIO.downloadFile(new URL(url), envFile);
+            // 尝试下载 sha1 文件；本地 file:// 仓库可能没有 sha1，则用 jar 自行生成
+            try {
+                PrimitiveIO.downloadFile(new URL(url + ".sha1"), shaFile);
+            } catch (IOException ignored) {
+                if (IS_DEV_MODE) {
+                    PrimitiveIO.debug("无法下载 {0}-{1}.jar.sha1，将用 jar 自行生成。", name, version);
+                    if (envFile.exists()) {
+                        generateSha1File(envFile, shaFile);
+                    }
+                } else {
+                    throw new IOException("无法下载 " + url + ".sha1");
+                }
+            }
+            return true;
+        } catch (IOException e) {
+            // 该仓库不可用时不再抛出，交由调用方回退到下一个仓库
+            PrimitiveIO.debug("仓库 {0} 下载 {1}:{2}:{3} 失败，尝试下一个仓库。", repo, group, name, version);
+            // 清理可能已写入的半成品，避免污染校验与后续加载
+            if (envFile.exists() && !envFile.delete()) {
+                PrimitiveIO.debug("无法删除残留文件 {0}", envFile.getAbsolutePath());
+            }
+            if (shaFile.exists() && !shaFile.delete()) {
+                PrimitiveIO.debug("无法删除残留文件 {0}", shaFile.getAbsolutePath());
+            }
+            return false;
+        }
+    }
+
+    /**
      * 加载完整模块
      */
     static void loadAll() throws Throwable {
@@ -190,7 +241,7 @@ public class PrimitiveLoader {
         long time = TabooLib.execution(() -> {
             List<String[]> rule = rule();
             // 加载 env 启动 Kotlin 环境
-            load(REPO_TABOOLIB, TABOOLIB_GROUP, "common-env", TABOOLIB_VERSION, IS_ISOLATED_MODE, true, rule);
+            load(REPO_TABOOLIB_LIST, TABOOLIB_GROUP, "common-env", TABOOLIB_VERSION, IS_ISOLATED_MODE, true, rule);
             // 如果 Kotlin 环境启动失败
             if (!TabooLib.isKotlinEnvironment()) {
                 String kotlinClass = "kotlin.Lazy";
@@ -200,13 +251,13 @@ public class PrimitiveLoader {
                 ));
             }
             // 加载 util 注册 ClassAppender Callback 回调函数
-            load(REPO_TABOOLIB, TABOOLIB_GROUP, "common-util", TABOOLIB_VERSION, IS_ISOLATED_MODE, true, rule);
+            load(REPO_TABOOLIB_LIST, TABOOLIB_GROUP, "common-util", TABOOLIB_VERSION, IS_ISOLATED_MODE, true, rule);
             // 加载剩余模块 >> 此时 isExternal 参数才有实际作用
-            load(REPO_TABOOLIB, TABOOLIB_GROUP, "common-legacy-api", TABOOLIB_VERSION, IS_ISOLATED_MODE, false, rule);
-            load(REPO_TABOOLIB, TABOOLIB_GROUP, "common-platform-api", TABOOLIB_VERSION, IS_ISOLATED_MODE, false, rule);
+            load(REPO_TABOOLIB_LIST, TABOOLIB_GROUP, "common-legacy-api", TABOOLIB_VERSION, IS_ISOLATED_MODE, false, rule);
+            load(REPO_TABOOLIB_LIST, TABOOLIB_GROUP, "common-platform-api", TABOOLIB_VERSION, IS_ISOLATED_MODE, false, rule);
             // 加载自选模块
             for (String i : INSTALL_MODULES) {
-                load(REPO_TABOOLIB, TABOOLIB_GROUP, i, TABOOLIB_VERSION, IS_ISOLATED_MODE, false, rule);
+                load(REPO_TABOOLIB_LIST, TABOOLIB_GROUP, i, TABOOLIB_VERSION, IS_ISOLATED_MODE, false, rule);
             }
         });
         PrimitiveIO.debug("所有依赖加载完成，用时 {0} 毫秒。", time);

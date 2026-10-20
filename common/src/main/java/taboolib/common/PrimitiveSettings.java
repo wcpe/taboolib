@@ -4,6 +4,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 
 import static java.lang.System.getProperty;
@@ -94,14 +96,67 @@ public class PrimitiveSettings {
     public static final String REPO_CENTRAL = RUNTIME_PROPERTIES.getProperty("repo-central", getProperty("taboolib.repo.central", "https://maven.aliyun.com/repository/central"));
 
     /**
-     * TabooLib 仓库
+     * 解析出的仓库列表末尾追加的兜底仓库，保证上游官方版本始终可达。
      */
-    public static final String REPO_TABOOLIB = RUNTIME_PROPERTIES.getProperty("repo-taboolib", getProperty("taboolib.repo.self", "https://repo.tabooproject.org/repository/releases"));
+    private static final String FALLBACK_REPO = "https://repo.tabooproject.org/repository/releases";
+
+    /**
+     * TabooLib 仓库
+     * 支持配置多个仓库，以英文逗号或分号分隔，例如 "https://a,https://b"。
+     * 注意：实际下载请使用 {@link #REPO_TABOOLIB_LIST}，它按顺序回退。
+     */
+    public static final String REPO_TABOOLIB = RUNTIME_PROPERTIES.getProperty("repo-taboolib", getProperty("taboolib.repo.self", "https://repo.wcpe.top/repository/maven-public/"));
 
     /**
      * Reflex 仓库（一般不会修改）
+     * 支持配置多个仓库，写法同 {@link #REPO_TABOOLIB}。
      */
-    public static final String REPO_REFLEX = RUNTIME_PROPERTIES.getProperty("repo-reflex", getProperty("taboolib.repo.reflex", "https://maven.wcpe.top/repository/maven-public/"));
+    public static final String REPO_REFLEX = RUNTIME_PROPERTIES.getProperty("repo-reflex", getProperty("taboolib.repo.reflex", "https://repo.wcpe.top/repository/maven-public/"));
+
+    /**
+     * TabooLib 仓库列表：按顺序尝试，前一个仓库下载失败则回退到下一个。
+     * 默认 wcpe 优先、tabooproject 官方仓库兜底，避免 wcpe 未同步的上游版本无法下载。
+     */
+    public static final String[] REPO_TABOOLIB_LIST = buildRepoList(REPO_TABOOLIB);
+
+    /**
+     * Reflex 仓库列表：按顺序尝试，默认 wcpe 优先、tabooproject 兜底。
+     */
+    public static final String[] REPO_REFLEX_LIST = buildRepoList(REPO_REFLEX);
+
+    /**
+     * 将仓库配置解析为有序的候选仓库列表。
+     * 配置值可用英文逗号或分号分隔多个仓库；解析结果会去重并忽略空项，
+     * 最后追加官方兜底仓库（若尚未包含），确保「wcpe 优先、上游兜底」始终成立。
+     */
+    static String[] buildRepoList(String configured) {
+        List<String> repos = new ArrayList<>();
+        if (configured != null) {
+            for (String i : configured.split("[,;]")) {
+                addRepo(repos, i);
+            }
+        }
+        // 兜底：无论是否自定义配置，都保证官方仓库可被尝试（已存在则不重复追加）
+        addRepo(repos, FALLBACK_REPO);
+        return repos.toArray(new String[0]);
+    }
+
+    /**
+     * 归一化仓库地址后加入列表：去掉首尾空白与结尾斜杠，忽略空项与重复项。
+     * 去掉结尾斜杠是必要的，否则 "https://a/" 与 "https://a" 会被当作两个不同仓库重复下载。
+     */
+    private static void addRepo(List<String> repos, String repo) {
+        if (repo == null) {
+            return;
+        }
+        String value = repo.trim();
+        while (value.endsWith("/")) {
+            value = value.substring(0, value.length() - 1);
+        }
+        if (!value.isEmpty() && !repos.contains(value)) {
+            repos.add(value);
+        }
+    }
 
     /**
      * libs 位置

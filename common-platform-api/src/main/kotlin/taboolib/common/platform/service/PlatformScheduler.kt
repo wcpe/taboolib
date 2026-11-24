@@ -51,6 +51,7 @@ interface PlatformScheduler {
          * 提交任务，不在提交线程内联执行。参数单位为 tick；周期为 0 表示执行一次。
          * Folia 的异步调度按每 tick 50 毫秒换算，不随服务器 TPS 变化；
          * tick 过大导致换算溢出时抛出 [ArithmeticException]。
+         * 周期任务在 Folia 上要求初始延时不小于 1 tick，delay 为 0 时按 1 tick（50 毫秒）起跳。
          */
         fun schedule(delayTicks: Long = 0, periodTicks: Long = 0, task: Runnable): Task {
             require(delayTicks >= 0) { "调度延时不能为负数" }

@@ -8,15 +8,8 @@ repositories {
 
 val foliaApi = "io.paper:folia-api:1.21.4"
 val adventureApi = "net.kyori:adventure-api:4.9.2"
-// 仅桥接编译时使用 Folia 的 Bukkit 接口，避免替换主源集依赖的旧 Bukkit 接口。
-val foliaBridge = sourceSets.create("foliaBridge")
-sourceSets.main { output.dir(foliaBridge.output) }
-tasks.named<Jar>("sourcesJar") { from(foliaBridge.allSource) }
 
 dependencies {
-    add(foliaBridge.compileOnlyConfigurationName, foliaApi)
-    add(foliaBridge.compileOnlyConfigurationName, adventureApi) { isTransitive = false }
-    compileOnly(foliaBridge.output)
     compileOnly(project(":common"))
     compileOnly(project(":common-platform-api"))
     compileOnly(project(":common-util"))

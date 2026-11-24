@@ -3,6 +3,7 @@ package taboolib.common.platform;
 import org.jetbrains.annotations.Nullable;
 import org.tabooproject.reflex.Reflex;
 import taboolib.common.LifeCycle;
+import taboolib.common.PrimitiveIO;
 import taboolib.common.TabooLib;
 
 /**
@@ -27,10 +28,25 @@ public final class PluginLifecycle {
         }
 
         failure = runCleanup(failure, () -> TabooLib.lifeCycle(LifeCycle.DISABLE));
-        failure = runCleanup(failure, Reflex::clearCaches);
+        failure = runCleanup(failure, PluginLifecycle::clearReflexCaches);
 
         if (failure != null) {
             rethrow(failure);
+        }
+    }
+
+    /**
+     * 清理反射缓存。
+     *
+     * Reflex 是 compileOnly 依赖，运行时可能由隔离类加载器持有、不在插件自身的类加载器中。
+     * 此时即便直接引用也会有 {@link LinkageError}，因此这里就地忽略链接错误，避免一个可选的
+     * 清理步骤中断整个关闭流程；真正的清理异常仍需向上抛出。
+     */
+    private static void clearReflexCaches() {
+        try {
+            Reflex.clearCaches();
+        } catch (LinkageError ex) {
+            PrimitiveIO.debug("跳过反射缓存清理，当前类加载器中缺少 Reflex：{0}", ex.toString());
         }
     }
 

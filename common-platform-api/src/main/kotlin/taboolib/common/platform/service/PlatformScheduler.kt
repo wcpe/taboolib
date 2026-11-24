@@ -1,0 +1,46 @@
+package taboolib.common.platform.service
+
+import taboolib.common.Inject
+import taboolib.common.platform.PlatformService
+import taboolib.common.util.Location
+
+/** 由调用方指定任务的所有者，平台实现负责把任务送到对应线程。 */
+@Inject
+@PlatformService
+interface PlatformScheduler {
+
+    /** 服务器范围的任务，不用于访问 Folia 的区域或实体状态。 */
+    fun global(): Scope
+
+    /** 不访问游戏世界或实体状态的任务。 */
+    fun async(): Scope
+
+    /** 位置所属区域的任务；普通 Bukkit 上使用主线程。目标位置在此处快照。 */
+    fun region(location: Location): Scope
+
+    /**
+     * 在实体所属线程执行，跨区时跟随实体。任务未能入队时抛出异常；已入队但实体失效时，
+     * 可用 [onRetired] 通知调用方。退休回调只做轻量清理，不访问世界或实体，不阻塞。
+     */
+    fun entity(target: EntityTarget, onRetired: Runnable? = null): Scope
+
+    /** 由平台适配器包装的实体引用，不进行实体查找。 */
+    interface EntityTarget
+
+    fun interface Task {
+        fun cancel()
+    }
+
+    class Scope(private val submit: (Long, Long, Runnable) -> Task) {
+
+        /**
+         * 提交任务，不在提交线程内联执行。参数单位为 tick；周期为 0 表示执行一次。
+         * Folia 的异步调度按每 tick 50 毫秒换算，不随服务器 TPS 变化。
+         */
+        fun schedule(delayTicks: Long = 0, periodTicks: Long = 0, task: Runnable): Task {
+            require(delayTicks >= 0) { "调度延时不能为负数" }
+            require(periodTicks >= 0) { "调度周期不能为负数" }
+            return submit(delayTicks, periodTicks, task)
+        }
+    }
+}

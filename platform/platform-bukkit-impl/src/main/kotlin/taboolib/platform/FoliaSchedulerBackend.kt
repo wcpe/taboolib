@@ -1,5 +1,8 @@
 package taboolib.platform
 
+import io.papermc.paper.threadedregions.scheduler.EntityScheduler
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask
+import org.bukkit.plugin.Plugin
 import taboolib.common.platform.service.PlatformScheduler
 import taboolib.common.platform.service.PlatformScheduler.EntityTarget
 import taboolib.common.platform.service.PlatformScheduler.Scope
@@ -68,16 +71,31 @@ internal class FoliaSchedulerBackend : PlatformScheduler {
     override fun entity(target: EntityTarget, onRetired: Runnable?): Scope {
         val scheduler = FoliaExecutor.getEntityScheduler(target.requireBukkitEntity())
         return Scope { delay, period, task ->
-            val plugin = BukkitPlugin.getInstance()
-            val handle = when {
-                period > 0 -> scheduler.runAtFixedRate(plugin, { task.run() }, onRetired, delay.coerceAtLeast(1), period)
-                delay > 0 -> scheduler.runDelayed(plugin, { task.run() }, onRetired, delay)
-                else -> scheduler.run(plugin, { task.run() }, onRetired)
-            }
-            // 实体在提交时即已失效，Folia 会同步触发退休回调并返回 null，此时没有可取消的句柄
-            handle?.let { Task { it.cancel() } } ?: Task { }
+            submitEntityTask(scheduler, BukkitPlugin.getInstance(), delay, period, task, onRetired)
         }
     }
 
     private fun millis(ticks: Long): Long = Math.multiplyExact(ticks, 50L)
+
+    internal companion object {
+
+        /**
+         * 向实体调度器提交任务。
+         *
+         * 调度器已退休时 `run` / `runDelayed` / `runAtFixedRate` 返回 null 且不会触发任何回调，
+         * 这里补发一次退休通知以兑现 [PlatformScheduler.entity] 的契约；实体在任务入队后才
+         * 失效的正常路径由调度器自身触发退休回调，不重复通知。
+         */
+        internal fun submitEntityTask(scheduler: EntityScheduler, plugin: Plugin, delay: Long, period: Long, task: Runnable, onRetired: Runnable?): Task {
+            val handle: ScheduledTask? = when {
+                period > 0 -> scheduler.runAtFixedRate(plugin, { task.run() }, onRetired, delay.coerceAtLeast(1), period)
+                delay > 0 -> scheduler.runDelayed(plugin, { task.run() }, onRetired, delay)
+                else -> scheduler.run(plugin, { task.run() }, onRetired)
+            }
+            if (handle == null) {
+                onRetired?.run()
+            }
+            return handle?.let { Task { it.cancel() } } ?: Task { }
+        }
+    }
 }

@@ -19,10 +19,18 @@ interface PlatformScheduler {
     fun region(location: Location): Scope
 
     /**
-     * 在实体所属线程执行，跨区时跟随实体。任务未能入队时抛出异常；已入队但实体失效时，
-     * 可用 [onRetired] 通知调用方。退休回调只做轻量清理，不访问世界或实体，不阻塞。
+     * 在实体所属线程执行，跨区时跟随实体。
+     *
+     * 后端拒绝接收任务时（参数非法、插件已禁用等）抛出异常；实体在提交时即已失效，
+     * 或任务已入队后才失效，都只通过 [onRetired] 通知，不抛出异常。
+     *
+     * [onRetired] 可能在任意线程被同步或异步调用，只做轻量清理：不访问世界或实体，
+     * 不阻塞，也不要假定当时处于主线程。未提供 [onRetired] 时调用方无法感知实体失效。
      */
-    fun entity(target: EntityTarget, onRetired: Runnable? = null): Scope
+    fun entity(target: EntityTarget, onRetired: Runnable?): Scope
+
+    /** 不关心实体失效通知的写法，等价于 [entity] 传入 `null`。 */
+    fun entity(target: EntityTarget): Scope = entity(target, null)
 
     /** 由平台适配器包装的实体引用，不进行实体查找。 */
     interface EntityTarget
@@ -35,7 +43,8 @@ interface PlatformScheduler {
 
         /**
          * 提交任务，不在提交线程内联执行。参数单位为 tick；周期为 0 表示执行一次。
-         * Folia 的异步调度按每 tick 50 毫秒换算，不随服务器 TPS 变化。
+         * Folia 的异步调度按每 tick 50 毫秒换算，不随服务器 TPS 变化；
+         * tick 过大导致换算溢出时抛出 [ArithmeticException]。
          */
         fun schedule(delayTicks: Long = 0, periodTicks: Long = 0, task: Runnable): Task {
             require(delayTicks >= 0) { "调度延时不能为负数" }

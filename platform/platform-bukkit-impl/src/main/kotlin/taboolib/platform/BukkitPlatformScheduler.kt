@@ -44,6 +44,7 @@ internal class BukkitSchedulerBackend : PlatformScheduler {
     override fun async(): Scope = asyncScope
 
     override fun region(location: Location): Scope {
+        // 普通 Bukkit 没有区域划分，位置只用于校验世界可用，任务统一交给主线程
         location.requireBukkitWorld()
         return mainScope
     }

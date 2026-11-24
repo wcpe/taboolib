@@ -25,7 +25,8 @@ internal class FoliaSchedulerBackend : PlatformScheduler {
         val plugin = BukkitPlugin.getInstance()
         val scheduler = FoliaSchedulerAccess.async(plugin.server)
         val handle = when {
-            period > 0 -> scheduler.runAtFixedRate(plugin, { task.run() }, millis(delay), millis(period), MILLISECONDS)
+            // Folia 的异步调度要求初始延时大于零，delay 为 0 时按最早的一毫秒处理
+            period > 0 -> scheduler.runAtFixedRate(plugin, { task.run() }, millis(delay.coerceAtLeast(1)), millis(period), MILLISECONDS)
             delay > 0 -> scheduler.runDelayed(plugin, { task.run() }, millis(delay), MILLISECONDS)
             else -> scheduler.runNow(plugin) { task.run() }
         }
@@ -59,8 +60,8 @@ internal class FoliaSchedulerBackend : PlatformScheduler {
                 delay > 0 -> scheduler.runDelayed(plugin, { task.run() }, onRetired, delay)
                 else -> scheduler.run(plugin, { task.run() }, onRetired)
             }
-            checkNotNull(handle) { "实体已失效，任务未入队" }
-            Task { handle.cancel() }
+            // 实体在提交时即已失效，Folia 会同步触发退休回调并返回 null，此时没有可取消的句柄
+            handle?.let { Task { it.cancel() } } ?: Task { }
         }
     }
 

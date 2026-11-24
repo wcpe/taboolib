@@ -1,11 +1,12 @@
-package taboolib.common.platform
+package taboolib.common.platform.service
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.DisplayName
 import org.junit.jupiter.api.Test
-import taboolib.common.platform.service.PlatformScheduler
+import taboolib.common.util.Location
 
 class PlatformSchedulerTest {
 
@@ -36,5 +37,38 @@ class PlatformSchedulerTest {
 
         assertThrows(IllegalArgumentException::class.java) { scope.schedule(delayTicks = -1) {} }
         assertThrows(IllegalArgumentException::class.java) { scope.schedule(periodTicks = -1) {} }
+    }
+
+    @Test
+    @DisplayName("后端拒绝接收任务时异常向上传播")
+    fun propagatesBackendRejection() {
+        val scope = PlatformScheduler.Scope { _, _, _ -> throw IllegalStateException("插件已禁用") }
+
+        val exception = assertThrows(IllegalStateException::class.java) { scope.schedule {} }
+        assertEquals("插件已禁用", exception.message)
+    }
+
+    @Test
+    @DisplayName("单参 entity 等价于传入空的退休回调")
+    fun entityWithoutRetiredDelegatesToNull() {
+        var received: Runnable? = Runnable { }
+        val target = object : PlatformScheduler.EntityTarget {}
+        val scheduler = object : PlatformScheduler {
+
+            override fun global() = error("未使用")
+
+            override fun async() = error("未使用")
+
+            override fun region(location: Location) = error("未使用")
+
+            override fun entity(target: PlatformScheduler.EntityTarget, onRetired: Runnable?): PlatformScheduler.Scope {
+                received = onRetired
+                return PlatformScheduler.Scope { _, _, _ -> PlatformScheduler.Task { } }
+            }
+        }
+
+        scheduler.entity(target)
+
+        assertNull(received)
     }
 }

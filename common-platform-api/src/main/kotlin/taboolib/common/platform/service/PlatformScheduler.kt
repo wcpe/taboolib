@@ -4,7 +4,13 @@ import taboolib.common.Inject
 import taboolib.common.platform.PlatformService
 import taboolib.common.util.Location
 
-/** 由调用方指定任务的所有者，平台实现负责把任务送到对应线程。 */
+/**
+ * 由调用方指定任务的所有者，平台实现负责把任务送到对应线程。
+ *
+ * 目前只有 Bukkit（含 Folia）提供服务实例，通过
+ * [taboolib.common.platform.function.schedulerService] 获取时在其它平台上为 null，
+ * 跨平台代码需要判空并降级到 [taboolib.common.platform.function.executorService]。
+ */
 @Inject
 @PlatformService
 interface PlatformScheduler {

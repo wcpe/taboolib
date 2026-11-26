@@ -101,6 +101,11 @@ public class PrimitiveSettings {
     private static final String FALLBACK_REPO = "https://repo.tabooproject.org/repository/releases";
 
     /**
+     * fork 自有仓库：wcpe.x 私有版本的唯一来源，在候选列表中恒居首位。
+     */
+    private static final String WCPE_REPO = "https://repo.wcpe.top/repository/maven-public";
+
+    /**
      * TabooLib 仓库
      * 支持配置多个仓库，以英文逗号或分号分隔，例如 "https://a,https://b"。
      * 注意：实际下载请使用 {@link #REPO_TABOOLIB_LIST}，它按顺序回退。
@@ -131,6 +136,9 @@ public class PrimitiveSettings {
      */
     static String[] buildRepoList(String configured) {
         List<String> repos = new ArrayList<>();
+        // wcpe 仓库恒居首：上游 gradle 插件构建插件包时会把 repo.tabooproject.org 烧录进 env.properties，
+        // 若照单全收则 fork 私有版本（wcpe.x）在上游站永远拉不到——fork 分发正确性优先于烧录顺序。
+        addRepo(repos, WCPE_REPO);
         if (configured != null) {
             for (String i : configured.split("[,;]")) {
                 addRepo(repos, i);

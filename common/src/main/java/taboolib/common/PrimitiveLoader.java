@@ -214,6 +214,11 @@ public class PrimitiveLoader {
                     throw new IOException("无法下载 " + url + ".sha1");
                 }
             }
+            // 立即校验：部分仓库（如 repo.tabooproject.org）对缺失构件返回 HTML 200 而非 404，
+            // 不抛异常的「成功下载」实际是污染页——必须在校验失败时按下载失败处理，否则会跳过后续可用仓库。
+            if (!PrimitiveIO.validation(envFile, shaFile)) {
+                throw new IOException("下载内容校验失败（可能为仓库污染响应）: " + url);
+            }
             return true;
         } catch (IOException e) {
             // 该仓库不可用时不再抛出，交由调用方回退到下一个仓库
